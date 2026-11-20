@@ -1,0 +1,1 @@
+-keep public class org.huxerui.lib.bluetooth.BluetoothModule$Factory { public *; }

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Bluetooth Preview
+Exec=example_bluetooth
+Icon=example_bluetooth
+Categories=Utility;
+Terminal=false
