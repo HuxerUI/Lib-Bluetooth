@@ -1,6 +1,6 @@
 # HuxerUI Bluetooth Library Design
 
-**Status** — Foreground BLE client implemented. Release support depends on platform device verification.
+**Status** — Foreground BLE client and peripheral operations implemented. Release support depends on platform device verification.
 
 `HuxerUI::Bluetooth` gives HuxerUI applications a typed C++ API for discovering nearby devices, acquiring access, and exchanging data. The first public release covers all six current HuxerUI targets. Android, iOS, macOS, Windows, and Linux provide foreground BLE discovery and a GATT client. Web provides browser-managed device selection and the same GATT client workflow on supported browser and operating system combinations.
 
@@ -14,7 +14,7 @@ The public contract describes operations and capabilities. Each backend reports 
 | Device discovery | Bounded foreground scanning on native platforms, browser device selection on Web, and device recovery where the host permits it | Additional scan filters and system accessory setup flows |
 | Pairing | System-managed authentication for protected GATT operations, plus explicit pairing and bond queries on supported backends | Unpairing and platform-specific association management |
 | BLE client | Connect, discover, read, write, subscribe, disconnect, and recover a foreground connection with its subscriptions | Background communication and process restoration |
-| BLE peripheral | Capability reporting for advertising and GATT server operations | Advertising, local GATT services, and server-side request handling |
+| BLE peripheral | Foreground advertising and local GATT read, write with response, and notifications where supported | Additional advertising fields, custom descriptors, access protection, and peer-targeted updates |
 | Additional transports | The device model leaves room for transport-specific endpoints | Classic RFCOMM, applicable Apple accessory sessions, and LE L2CAP channels |
 
 Qt Bluetooth provides separate interfaces for GATT and Bluetooth sockets. Capacitor BLE exposes continuous scanning and device selection as separate operations. FlutterBluePlus models service invalidation separately from connection state. These are useful boundaries for a library that spans native applications and browsers. [Qt Bluetooth](https://doc.qt.io/qt-6/qtbluetooth-index.html) · [Capacitor BLE](https://github.com/capacitor-community/bluetooth-le) · [FlutterBluePlus](https://pub.dev/packages/flutter_blue_plus)
@@ -88,6 +88,7 @@ struct BluetoothCapabilities {
   bool can_access_descriptors = false;
   bool can_advertise = false;
   bool can_use_gatt_server = false;
+  bool can_advertise_standalone = false;
 };
 
 class Device final {
@@ -549,9 +550,217 @@ The Preview stores one selected device identifier in the application data direct
 
 ### Advertising and local GATT
 
-Expose advertising and GATT server as independent capabilities. An advertising session owns its lifetime and reports when the platform actually starts advertising. Its options describe requested service UUIDs, names, manufacturer data, connectability, and payload size only where those fields are supported. Core Bluetooth constrains the fields available for general advertising. Return an explicit result when a requested option is unavailable. [Apple advertising API](https://developer.apple.com/documentation/corebluetooth/cbperipheralmanager/startadvertising(_:)) · [BlueZ advertising API](https://bluez.readthedocs.io/en/latest/advertising-api/)
+Add both operations to the existing `Bluetooth` service. `can_advertise` reports whether the current backend and adapter support any advertising path. `can_use_gatt_server` reports whether they can open a local GATT server. The application owns advertising and local service configuration through separate move-only handles.
 
-A GATT server owns registered services, characteristic and descriptor definitions, security requirements, per-peer subscriptions, and server-side read and write callbacks. Respond to requests within the host's deadline. Support peer targeting and backpressure when sending notifications or indications. Test radio capacity, concurrent roles, and host-specific attribute restrictions before publishing support. [Windows GATT server](https://learn.microsoft.com/en-us/windows/uwp/devices-sensors/gatt-server) · [BlueZ GATT API](https://bluez.readthedocs.io/en/latest/gatt-api/)
+Use `BluetoothCapabilities::can_advertise_standalone` to offer standalone advertising in the application UI. A true `can_advertise_standalone` implies `can_advertise`. An application can offer service-associated advertising when both `can_advertise` and `can_use_gatt_server` are true. The operation result accounts for the requested combination, payload, permissions, and resources.
+
+```cpp
+/// Supports at least one advertising mode without an open local GATT server.
+bool can_advertise_standalone = false;
+```
+
+#### Public declarations
+
+The declarations in `huxerui::bluetooth` use the same `Task`, `BluetoothResult`, `OperationOptions`, `Bytes`, `GattCharacteristicProperties`, and UUID formats as the client. Private handle storage is omitted.
+
+```cpp
+/// @brief Normal termination of one advertising or server session.
+enum class PeripheralEndReason { Stopped, Backgrounded };
+
+/// @brief A normal stop or a terminal error reported by the session.
+using PeripheralEndEvent = std::variant<PeripheralEndReason, BluetoothError>;
+
+/// @brief Rejection to send for an incoming attribute request.
+enum class GattRequestError { NotPermitted, InvalidValueLength, UnlikelyError };
+
+/// @brief Definition and request handlers for one local characteristic.
+struct LocalGattCharacteristic {
+  /// UUID within the enclosing service.
+  std::string uuid;
+
+  /// Properties to expose. The first release supports read, write with response, and notify.
+  GattCharacteristicProperties properties;
+
+  /// Returns the complete current value for one ATT read request, including a read at a nonzero offset.
+  std::function<Result<Bytes, GattRequestError>()> on_read;
+
+  /// Accepts or rejects one complete replacement value from a remote write.
+  std::function<Result<void, GattRequestError>(Bytes)> on_write;
+
+  /// Reports whether the characteristic has any subscribed peers.
+  std::function<void(bool has_subscribers)> on_subscription_changed;
+};
+
+/// @brief Definition of one primary service on the local GATT server.
+struct LocalGattService {
+  /// UUID unique within the enclosing server.
+  std::string uuid;
+
+  /// Characteristics to publish in this service.
+  std::vector<LocalGattCharacteristic> characteristics;
+};
+
+/// @brief Unique owner of a set of local service definitions.
+class GattServerSession final {
+public:
+  GattServerSession(GattServerSession&& other) noexcept;
+
+  GattServerSession& operator=(GattServerSession&& other) noexcept;
+
+  ~GattServerSession();
+
+  /// @brief Submits a value update to the characteristic's subscribed peers.
+  /// @param service_uuid UUID of a service configured by this session.
+  /// @param characteristic_uuid UUID of the notification characteristic within the service.
+  /// @param value Owned update bytes.
+  /// @param options Deadline for accepting and submitting the update.
+  /// @return Success when the platform accepts the update, or an operation error.
+  Task<BluetoothResult<void>> NotifyAsync(std::string service_uuid, std::string characteristic_uuid,
+                                          Bytes value, OperationOptions options = {});
+
+  /// @brief Retires the local services. Retain the handle to receive the terminal event.
+  void Stop() noexcept;
+};
+
+struct AdvertisingOptions {
+  /// Service UUIDs to advertise. Accepts the same UUID formats as ScanOptions.
+  std::vector<std::string> service_uuids;
+
+  /// Requested local name, subject to the platform's advertising rules.
+  std::optional<std::string> local_name;
+
+  /// Requested connectability. An empty value uses the default for the selected overload.
+  std::optional<bool> connectable;
+};
+
+/// @brief Unique owner of one advertising operation.
+class AdvertisingSession final {
+public:
+  AdvertisingSession(AdvertisingSession&& other) noexcept;
+
+  AdvertisingSession& operator=(AdvertisingSession&& other) noexcept;
+
+  ~AdvertisingSession();
+
+  /// @brief Stops this advertisement. Retain the handle to receive the terminal event.
+  void Stop() noexcept;
+};
+
+// Members of Bluetooth.
+/// @brief Opens a local GATT server with the supplied primary services and handlers.
+/// @param services Owned service definitions and callbacks.
+/// @param options Deadline for opening the server.
+/// @param on_end Optional terminal callback for an acquired server session.
+/// @return A server with its configuration ready, or an operation error. Publication follows platform rules.
+Task<BluetoothResult<GattServerSession>> OpenGattServerAsync(
+    std::vector<LocalGattService> services, OperationOptions options = {},
+    std::function<void(PeripheralEndEvent)> on_end = {});
+
+/// @brief Starts a standalone advertisement.
+/// @param advertisement Service UUIDs, name, and connectability requested for the advertisement.
+/// @param options Deadline for startup.
+/// @param on_end Optional terminal callback for an acquired advertising session.
+/// @return An active advertising session or an operation error.
+Task<BluetoothResult<AdvertisingSession>> StartAdvertisingAsync(
+    AdvertisingOptions advertisement, OperationOptions options = {},
+    std::function<void(PeripheralEndEvent)> on_end = {});
+
+/// @brief Starts advertising services configured by a local GATT server.
+/// @param server Server that owns the selected services.
+/// @param advertisement The local service UUIDs to advertise and any supported payload options.
+/// @param options Deadline for startup.
+/// @param on_end Optional terminal callback for an acquired advertising session.
+/// @return An active advertising session or an operation error.
+Task<BluetoothResult<AdvertisingSession>> StartAdvertisingAsync(
+    const GattServerSession& server, AdvertisingOptions advertisement, OperationOptions options = {},
+    std::function<void(PeripheralEndEvent)> on_end = {});
+```
+
+#### Advertising and ownership
+
+- The first advertising overload requests a standalone advertisement. Supply service UUIDs, a nonempty local name, or both. An empty `connectable` uses the platform default. An explicit value requests that mode.
+- The server overload requests connectable advertising for a nonempty subset of that server's service UUIDs. `service_uuids` selects which UUIDs to advertise. The complete server configuration defines the set of services available for remote discovery once published. On platforms that publish through advertising, successful startup covers the complete configured set. A platform that cannot satisfy the requested combination returns `Unsupported`. An explicit `false` is invalid for this overload. The call captures the server's identity before the Task starts. The server must still be open on the same application and adapter at admission. Retaining the advertising handle never extends server lifetime.
+- Complete startup when the platform confirms advertising has started. Report `Unsupported` for an unavailable advertising mode or payload field, `PayloadTooLarge` for a known size violation, and `Busy` for resource contention. Success reflects platform acceptance. Packet contents and discovery remain subject to platform policy. When the platform explicitly reports that requested data was omitted, fail startup and roll back the advertisement.
+- Each start is a lazy Task with the existing per-operation deadline. Admit new sessions while the application is active. Inactive transitions let existing sessions and pending starts continue. Entering the background retires both features and returns `Canceled` to callers still awaiting a start. Canceling the caller's Task detaches its continuation. An acquired session gets at most one terminal event. `Stop()` is idempotent and queues `Stopped`. A background transition queues `Backgrounded`. Use and destroy handles on the owning application thread. Destruction retires the session and suppresses pending delivery.
+- Stopping advertising leaves the logical server and its definitions available for another advertising start. Stopping a server ends advertising explicitly associated with it. A standalone advertisement keeps its own lifetime. On platforms where advertising controls publication, stopping associated advertising can withdraw remote access to the services while retaining the logical server.
+- A failed or canceled start rolls back partial platform registration. Keep the affected resource slot until late platform completion and cleanup are isolated from the next start. Startup errors go to the Task. Terminal events apply to sessions already handed to the caller.
+
+#### Local service registration and requests
+
+`OpenGattServerAsync()` takes ownership of the definitions and handlers. Success means the full configuration is ready. Backends that register local services independently publish them as part of opening the server. On Windows, associated advertising publishes the configured service. Each primary service requires a unique UUID within the server and each characteristic requires a unique UUID within its service. Reject empty definitions and duplicates with `InvalidArgument`. Select a notification characteristic by its service UUID and characteristic UUID. `GattService` and `GattCharacteristic` continue to represent remote discovery results.
+
+Activate application handlers only after server startup has committed. Until then, reject peer requests through the platform request path. An adapter can limit concurrent server registrations, advertising sessions, or combinations with scanning and client connections. Report `Busy` when an existing operation occupies a required resource.
+
+The initial contract supports read, write with response, and notify. Readable characteristics require `on_read` and writable characteristics require `on_write`. `on_subscription_changed` is optional for notification characteristics. Return `UnsupportedProperty` for other requested properties and `InvalidArgument` for missing required handlers. The platform or backend manages the Client Characteristic Configuration Descriptor (CCCD). Manufacturer and service data, custom descriptors, configurable attribute protection, indications, peer-targeted updates, and additional write modes can extend the respective operations later. Use the initial service contract for values that can be exposed without application-configured link protection.
+
+The backend owns each platform request and responds once within its deadline. Handlers run synchronously on the owning application thread and must return promptly. Map `GattRequestError` to the supported ATT rejection. A throwing request handler produces `UnlikelyError` where a response is possible. Application operation errors still use `BluetoothError`.
+
+`on_read()` returns a complete owned value for one ATT request. A follow-up Read Blob request can invoke the handler again and observe a newer value. The backend applies the offset and response limit to that request's value, rejecting an offset beyond its end. Applications that require a consistent long value must keep the value stable across requests or provide consistency through their device protocol. [Bluetooth ATT long attribute reads](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core_v7.0/out/en/host/attributeprotocol-att--specification.html)
+
+`on_write()` receives one complete replacement at offset zero. Reject write commands, prepared writes, nonzero offsets, and grouped transactions when exposed by the platform, before invoking the handler. If the platform supplies a single completed replacement, pass that replacement to the handler.
+
+Subscription callbacks report changes in whether at least one peer is subscribed, starting from an empty set. Use per-peer membership when visible to the backend and characteristic-level state on aggregate notification paths. Retire affected subscriptions on disconnect or unpublication when observable. `NotifyAsync()` submits to the then-subscribed peers of a published characteristic and succeeds as a no-op if there are none. Return `Unavailable` for a configured service that the platform has yet to publish. Success reflects platform submission. A failure can occur after partial submission. Enforce known payload limits and bounded flow control. Retire pending updates when the server closes. The application owns the value returned by `on_read` and decides whether a failed update can be retried.
+
+#### Platform mapping
+
+| Target | Advertising | Local GATT server |
+| --- | --- | --- |
+| Android | Use `BluetoothLeAdvertiser` and await the start callback. A requested local name is supported only when the platform can include the matching adapter name. | Use `BluetoothGattServer`. Register services sequentially and wait for each callback. Track CCCD subscriptions per peer and use the notification callback for flow control. [Advertiser](https://developer.android.com/reference/android/bluetooth/le/BluetoothLeAdvertiser) · [GATT server](https://developer.android.com/reference/android/bluetooth/BluetoothGattServer) |
+| iOS | Use `CBPeripheralManager` for service UUIDs and the optional name. Reject an explicit mode when Core Bluetooth cannot guarantee the requested connectability. | Publish through the iOS peripheral manager delegate. Map read offsets, write batches, and send-queue readiness. [Core Bluetooth](https://developer.apple.com/documentation/corebluetooth/cbperipheralmanager) · [Peripheral role tasks](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/PerformingCommonPeripheralRoleTasks/PerformingCommonPeripheralRoleTasks.html) |
+| macOS | Apply the same Core Bluetooth payload limits. The application supplies its Bluetooth usage description and sandbox entitlement where applicable. | Implement the peripheral manager delegate and lifetime in the macOS backend. [Core Bluetooth advertising](https://developer.apple.com/documentation/corebluetooth/cbperipheralmanager/startadvertising(_:)) · [Bluetooth entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.device.bluetooth) |
+| Windows | Start service-associated advertising through `GattServiceProvider`. The generic publisher reserves UUID and name fields, so set `can_advertise_standalone = false` and return `Unsupported` for standalone advertising in this release. | The initial backend supports one primary service per server. `OpenGattServerAsync()` configures its provider and characteristics and returns `Unsupported` for a valid multi-service request. Associated advertising publishes the configured service. Stopping it can withdraw remote access while preserving the configuration. Gate the features on WinRT, the adapter, and app configuration. Windows 7 reports both features as unsupported. [GATT server](https://learn.microsoft.com/en-us/windows/apps/develop/devices-sensors/gatt-server#publish-the-service) · [Publisher restrictions](https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.advertisement.bluetoothleadvertisementpublisher#remarks) |
+| Linux | Register an advertising object with BlueZ `LEAdvertisingManager1` when available on the adapter. | Register a separate local service tree through `GattManager1`. Map `StartNotify()` and `StopNotify()` to aggregate subscription state. [Advertising API](https://bluez.readthedocs.io/en/latest/advertising-api/) · [GATT API](https://bluez.readthedocs.io/en/latest/gatt-api/) |
+| Web | Report both advertising flags as false and return `Unsupported`. | Report `can_use_gatt_server = false` and return `Unsupported`. Browser GATT access uses the existing client API. [Web Bluetooth guide](https://developer.chrome.com/docs/capabilities/bluetooth) |
+
+Applications supply declarations and request permissions. Android 12 and later can require `BLUETOOTH_ADVERTISE` for advertising and `BLUETOOTH_CONNECT` for the server, depending on the target SDK. The Android Preview requests advertising access through its Activity and uses `Permission::BluetoothConnect` for the server. A missing grant returns `PermissionDenied`. If a submitted Android notification is interrupted, the backend retires its server to isolate the outstanding platform callback. iOS and macOS have separate platform implementations. [Android Bluetooth permissions](https://developer.android.com/develop/connectivity/bluetooth/bt-permissions)
+
+#### Application example
+
+Open the local server and then advertise its service on a supported host. Keep both handles in the owning model. The characteristic holds a one-byte value that fits in a single ATT read response.
+
+```cpp
+constexpr char service_uuid[] = "e1120001-14f2-43f3-a98b-cfd9b47fd9bb";
+constexpr char value_uuid[] = "e1120002-14f2-43f3-a98b-cfd9b47fd9bb";
+
+struct PeripheralModel {
+  std::shared_ptr<Bytes> value = std::make_shared<Bytes>(1, std::byte{0});
+  std::optional<GattServerSession> server;
+  std::optional<AdvertisingSession> advertising;
+};
+
+Task<void> OpenPeripheral(std::shared_ptr<Bluetooth> bluetooth, std::shared_ptr<PeripheralModel> model) {
+  LocalGattCharacteristic characteristic{
+      .uuid = value_uuid,
+      .properties = {.can_read = true, .can_write_with_response = true, .can_notify = true},
+      .on_read = [value = model->value] {
+        return Result<Bytes, GattRequestError>::Success(*value);
+      },
+      .on_write = [value = model->value](Bytes replacement) {
+        if (replacement.size() != 1)
+          return Result<void, GattRequestError>::Failure(GattRequestError::InvalidValueLength);
+        *value = std::move(replacement);
+        return Result<void, GattRequestError>::Success();
+      },
+  };
+  std::vector<LocalGattService> services{{service_uuid, {std::move(characteristic)}}};
+  auto server = co_await bluetooth->OpenGattServerAsync(std::move(services));
+  if (!server.Succeeded()) {
+    ShowBluetoothError(server.Error());
+    co_return;
+  }
+  model->server.emplace(std::move(server).Value());
+
+  AdvertisingOptions advertisement{.service_uuids = {service_uuid}};
+  auto advertising = co_await bluetooth->StartAdvertisingAsync(*model->server, std::move(advertisement));
+  if (advertising.Succeeded()) {
+    model->advertising.emplace(std::move(advertising).Value());
+  } else {
+    ShowBluetoothError(advertising.Error());
+  }
+}
+```
+
+When the application changes the value, call `co_await model->server->NotifyAsync(service_uuid, value_uuid, *model->value)` and handle the result. The Preview exposes controls to open the server, advertise its service, and notify subscribed peers. Each handle has its own stop action. The existing client can scan for `service_uuid`, then discover, read, write, and subscribe through its `GattSession`.
 
 ### Classic Bluetooth and other transports
 

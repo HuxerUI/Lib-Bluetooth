@@ -49,6 +49,7 @@ std::optional<std::string> NormalizeUuid(std::string_view input) {
 namespace {
 
 constexpr std::size_t max_pending_gatt_requests = 64;
+constexpr std::size_t max_gatt_attribute_value_size = 512;
 
 bool NormalizeUuids(std::vector<std::string>& uuids) {
   for (auto& uuid : uuids) {
@@ -117,6 +118,37 @@ struct Subscription {
   bool ready = false;
 };
 
+struct LocalAttribute {
+  std::string service_uuid;
+  LocalGattCharacteristic definition;
+  bool subscribed = false;
+  bool reported_subscription = false;
+
+  void DeliverSubscription() {
+    if (std::exchange(reported_subscription, subscribed) != subscribed && definition.on_subscription_changed)
+      definition.on_subscription_changed(subscribed);
+  }
+};
+
+struct PeripheralSession {
+  std::weak_ptr<Service> service;
+  Token id;
+  Operation operation;
+  Token server = 0;
+  std::map<Token, LocalAttribute> attributes;
+  EventHandler<PeripheralEndEvent> on_end;
+  std::optional<PeripheralEndEvent> ended;
+  bool acquired = false;
+};
+
+AttStatus AttError(GattRequestError error, bool write) {
+  switch (error) {
+    case GattRequestError::NotPermitted: return write ? AttStatus::WriteNotPermitted : AttStatus::ReadNotPermitted;
+    case GattRequestError::InvalidValueLength: return AttStatus::InvalidValueLength;
+    default: return AttStatus::UnlikelyError;
+  }
+}
+
 struct ConnectionSetup {
   std::optional<BluetoothError> interruption;
 };
@@ -157,6 +189,18 @@ struct Access {
 
   static GattSession MakeSession(std::shared_ptr<Session> session) {
     return GattSession(std::move(session));
+  }
+
+  static AdvertisingSession MakeAdvertisement(std::shared_ptr<PeripheralSession> session) {
+    return AdvertisingSession(std::move(session));
+  }
+
+  static GattServerSession MakeServer(std::shared_ptr<PeripheralSession> session) {
+    return GattServerSession(std::move(session));
+  }
+
+  static const auto& Get(const GattServerSession& server) {
+    return server.session_;
   }
 
   static Token Snapshot(const GattSession& session) {
@@ -253,6 +297,7 @@ struct Service : std::enable_shared_from_this<Service> {
   explicit Service(TaskScope scope) : tasks(std::move(scope)) {}
 
   ~Service() {
+    EndPeripherals(Error(Code::Unavailable, "Bluetooth service closed"));
     while (!reconnects.empty())
       CancelReconnect(reconnects.begin()->first, Error(Code::Unavailable, "Bluetooth service closed"));
     if (scan)
@@ -285,6 +330,7 @@ struct Service : std::enable_shared_from_this<Service> {
 
   void EnterBackground() {
     ++background_generation;
+    EndPeripherals(PeripheralEndReason::Backgrounded);
     if (scan)
       EndScan(scan->id, ScanEndReason::Stopped, true);
     while (!reconnects.empty()) {
@@ -310,7 +356,16 @@ struct Service : std::enable_shared_from_this<Service> {
   }
 
   BluetoothCapabilities Capabilities() const {
-    return backend_failed ? BluetoothCapabilities{} : PlatformCapabilities();
+    if (backend_failed)
+      return {};
+    auto capabilities = PlatformCapabilities();
+    if (backend) {
+      const auto peripheral = backend->PeripheralCapabilities();
+      capabilities.can_advertise = peripheral.can_advertise;
+      capabilities.can_advertise_standalone = peripheral.can_advertise_standalone;
+      capabilities.can_use_gatt_server = peripheral.can_use_gatt_server;
+    }
+    return capabilities;
   }
 
   std::optional<BluetoothError> Check(Operation operation) const {
@@ -322,6 +377,9 @@ struct Service : std::enable_shared_from_this<Service> {
       case Operation::Restore: supported = caps.can_restore_device; break;
       case Operation::Bond: supported = caps.can_query_bond; break;
       case Operation::Pair: supported = caps.can_pair; break;
+      case Operation::Advertise: supported = caps.can_advertise; break;
+      case Operation::OpenServer:
+      case Operation::SendNotification: supported = caps.can_use_gatt_server; break;
       default: break;
     }
     if (backend_failed)
@@ -344,6 +402,7 @@ struct Service : std::enable_shared_from_this<Service> {
                          "The Bluetooth adapter became unavailable");
       if (scan)
         EndScan(scan->id, error, true);
+      EndPeripherals(error);
       while (!links.empty())
         CloseLink(links.begin()->second, error, true);
     }
@@ -442,6 +501,117 @@ struct Service : std::enable_shared_from_this<Service> {
     for (const auto& listener : listeners) {
       if (const auto callback = listener->handler)
         (*callback)(event.value);
+    }
+  }
+
+  void Handle(ServerRequest request) {
+    const auto found = peripherals.find(request.server);
+    if (found == peripherals.end() || !found->second->acquired || (request.is_current && !request.is_current())) {
+      request.respond(AttStatus::UnlikelyError, {});
+      return;
+    }
+    const auto server = found->second;
+    const auto attribute = server->attributes.find(request.attribute);
+    if (attribute == server->attributes.end()) {
+      request.respond(AttStatus::RequestNotSupported, {});
+      return;
+    }
+    const auto& definition = attribute->second.definition;
+    AttStatus status = AttStatus::Success;
+    Bytes value;
+    try {
+      if (request.write) {
+        if (!definition.properties.can_write_with_response)
+          status = AttStatus::WriteNotPermitted;
+        else if (request.offset != 0)
+          status = AttStatus::InvalidOffset;
+        else if (request.value.size() > max_gatt_attribute_value_size)
+          status = AttStatus::InvalidValueLength;
+        else if (auto result = definition.on_write(std::move(request.value)); !result.Succeeded())
+          status = AttError(result.Error(), true);
+      } else if (!definition.properties.can_read) {
+        status = AttStatus::ReadNotPermitted;
+      } else {
+        auto result = definition.on_read();
+        if (!result.Succeeded()) {
+          status = AttError(result.Error(), false);
+        } else {
+          auto& bytes = result.Value();
+          if (bytes.size() > max_gatt_attribute_value_size) {
+            status = AttStatus::InvalidValueLength;
+          } else if (request.offset > bytes.size()) {
+            status = AttStatus::InvalidOffset;
+          } else {
+            const auto count = std::min(bytes.size() - request.offset, request.read_limit.value_or(bytes.size()));
+            value.assign(bytes.begin() + request.offset, bytes.begin() + request.offset + count);
+          }
+        }
+      }
+    } catch (...) {
+      status = AttStatus::UnlikelyError;
+    }
+    request.respond(status, std::move(value));
+  }
+
+  void Handle(ServerSubscription event) {
+    const auto found = peripherals.find(event.server);
+    if (found == peripherals.end())
+      return;
+    const auto server = found->second;
+    const auto attribute = server->attributes.find(event.attribute);
+    if (attribute == server->attributes.end())
+      return;
+    auto& local = attribute->second;
+    local.subscribed = event.subscribed;
+    if (server->acquired)
+      local.DeliverSubscription();
+  }
+
+  void Handle(PeripheralFailure event) {
+    EndPeripheral(event.session, std::move(event.error));
+  }
+
+  void EndPeripherals(const PeripheralEndEvent& event) {
+    while (!peripherals.empty())
+      EndPeripheral(peripherals.begin()->first, event);
+  }
+
+  void EndPeripheral(Token id, PeripheralEndEvent event) {
+    auto entry = peripherals.extract(id);
+    if (entry.empty())
+      return;
+    auto session = std::move(entry.mapped());
+    session->ended = event;
+    const bool server = session->operation == Operation::OpenServer;
+    if (server) {
+      while (true) {
+        auto attached = std::ranges::find_if(peripherals, [id](const auto& item) { return item.second->server == id; });
+        if (attached == peripherals.end())
+          break;
+        EndPeripheral(attached->first, event);
+      }
+    }
+    const auto* error = std::get_if<BluetoothError>(&event);
+    for (auto it = requests.begin(); it != requests.end();) {
+      const auto current = it++;
+      if (current->second.request.peripheral == id) {
+        Finish(current->first, error ? Reply::Failure(*error) : Fail(Code::Canceled, "Peripheral session stopped"),
+               true);
+      }
+    }
+    if (backend) {
+      if (server)
+        backend->CloseServer(id);
+      else
+        backend->StopAdvertising(id);
+    }
+    if (session->acquired && session->on_end) {
+      tasks.Post([weak = std::weak_ptr<PeripheralSession>(session), event = std::move(event)]() mutable {
+        if (auto owner = weak.lock(); owner && owner->on_end) {
+          auto handler = std::exchange(owner->on_end, {});
+          (*handler)(std::move(event));
+        }
+      });
     }
   }
 
@@ -598,6 +768,17 @@ struct Service : std::enable_shared_from_this<Service> {
       done.Complete(Reply::Failure(std::move(*error)));
       return {};
     }
+    if (request.operation == Operation::Advertise && request.server == 0 &&
+        !Capabilities().can_advertise_standalone) {
+      done.Complete(Fail(Code::Unsupported, "Standalone advertising is unavailable on the current platform"));
+      return {};
+    }
+    if (request.operation == Operation::SendNotification && std::ranges::any_of(requests, [&](const auto& item) {
+          return item.second.request.peripheral == request.peripheral;
+        })) {
+      done.Complete(Fail(Code::Busy, "A notification is already in progress for the local GATT server"));
+      return {};
+    }
     if (options.timeout <= std::chrono::milliseconds::zero()) {
       done.Complete(Fail(Code::InvalidArgument, "The operation timeout must be positive"));
       return {};
@@ -645,6 +826,7 @@ struct Service : std::enable_shared_from_this<Service> {
   std::map<Token, AdapterWatch> watches;
   std::shared_ptr<Scan> scan;
   std::map<Token, std::shared_ptr<Session>> links;
+  std::map<Token, std::shared_ptr<PeripheralSession>> peripherals;
   std::map<Token, Work> requests;
   std::map<Token, PendingReconnect> reconnects;
   std::shared_ptr<Selection> selection;
@@ -676,6 +858,166 @@ template <class T> Task<BluetoothResult<T>> AttributeOperation(std::shared_ptr<S
 
 template <class T> Task<BluetoothResult<T>> Reject(Code code, std::string message) {
   co_return BluetoothResult<T>::Failure(Error(code, std::move(message)));
+}
+
+std::shared_ptr<PeripheralSession> NewPeripheral(Service& service, Operation operation, Token server,
+                                                 std::function<void(PeripheralEndEvent)> on_end) {
+  auto session = std::make_shared<PeripheralSession>();
+  session->service = service.weak_from_this();
+  session->id = service.next++;
+  session->operation = operation;
+  session->server = server;
+  if (on_end)
+    session->on_end = std::make_shared<decltype(on_end)>(std::move(on_end));
+  return session;
+}
+
+BluetoothError PeripheralStopped(const PeripheralSession& session) {
+  if (session.ended) {
+    if (const auto* error = std::get_if<BluetoothError>(&*session.ended))
+      return *error;
+  }
+  return Error(Code::Canceled, "Peripheral session stopped");
+}
+
+Task<BluetoothResult<GattServerSession>> OpenServer(std::weak_ptr<Service> weak, std::vector<LocalGattService> services,
+                                                   OperationOptions options,
+                                                   std::function<void(PeripheralEndEvent)> on_end) {
+  using Result = BluetoothResult<GattServerSession>;
+  if (services.empty())
+    co_return Result::Failure(Error(Code::InvalidArgument, "Provide at least one local GATT service"));
+  if (UseApplication().LifecycleState() != ApplicationLifecycleState::Active)
+    co_return Result::Failure(Error(Code::Canceled, "Opening a GATT server requires an active application"));
+  auto service = weak.lock();
+  if (!service)
+    co_return Result::Failure(Error(Code::Unavailable, "Bluetooth service closed"));
+  auto session = NewPeripheral(*service, Operation::OpenServer, 0, std::move(on_end));
+  Request request{.operation = Operation::OpenServer, .peripheral = session->id};
+  std::set<std::string> service_uuids;
+  for (auto& definition : services) {
+    auto uuid = NormalizeUuid(definition.uuid);
+    if (!uuid || !service_uuids.insert(*uuid).second || definition.characteristics.empty())
+      co_return Result::Failure(Error(Code::InvalidArgument, "Invalid or duplicate local GATT service"));
+    ServerService local{std::move(*uuid), {}};
+    std::set<std::string> attribute_uuids;
+    for (auto& attribute : definition.characteristics) {
+      const auto props = attribute.properties;
+      if (props.can_write_without_response || props.can_indicate)
+        co_return Result::Failure(Error(Code::UnsupportedProperty, "Unsupported local characteristic properties"));
+      auto attribute_uuid = NormalizeUuid(attribute.uuid);
+      if (!attribute_uuid || !attribute_uuids.insert(*attribute_uuid).second ||
+          !(props.can_read || props.can_write_with_response || props.can_notify) ||
+          (props.can_read && !attribute.on_read) || (props.can_write_with_response && !attribute.on_write)) {
+        co_return Result::Failure(Error(Code::InvalidArgument, "Invalid local GATT characteristic definition"));
+      }
+      const auto id = service->next++;
+      local.characteristics.push_back({id, *attribute_uuid, props});
+      attribute.uuid = std::move(*attribute_uuid);
+      session->attributes.emplace(id, LocalAttribute{local.uuid, std::move(attribute)});
+    }
+    request.local_services.push_back(std::move(local));
+  }
+  service->peripherals.emplace(session->id, session);
+  service.reset();
+  auto owner = Access::MakeServer(session);
+  auto result = co_await Run(weak, std::move(request), options);
+  if (!result.Succeeded())
+    co_return Result::Failure(std::move(result).Error());
+  if (session->ended)
+    co_return Result::Failure(PeripheralStopped(*session));
+  session->acquired = true;
+  if (auto current = weak.lock()) {
+    current->tasks.Post([weak = std::weak_ptr<PeripheralSession>(session)] {
+      if (auto server = weak.lock(); server && !server->ended) {
+        for (auto& [id, attribute] : server->attributes) {
+          if (server->ended)
+            break;
+          attribute.DeliverSubscription();
+        }
+      }
+    });
+  }
+  co_return Result::Success(std::move(owner));
+}
+
+Task<BluetoothResult<void>> SendNotification(std::shared_ptr<PeripheralSession> session, std::string service_uuid,
+                                            std::string characteristic_uuid, Bytes value, OperationOptions options) {
+  using Result = BluetoothResult<void>;
+  if (!session || session->ended || !session->acquired)
+    co_return Result::Failure(Error(Code::Disconnected, "The local GATT server is closed"));
+  const auto service = NormalizeUuid(service_uuid);
+  const auto characteristic = NormalizeUuid(characteristic_uuid);
+  if (!service || !characteristic)
+    co_return Result::Failure(Error(Code::InvalidArgument, "Invalid local GATT characteristic UUID"));
+  const auto found = std::ranges::find_if(session->attributes, [&](const auto& item) {
+    return item.second.service_uuid == *service && item.second.definition.uuid == *characteristic;
+  });
+  if (found == session->attributes.end())
+    co_return Result::Failure(Error(Code::InvalidArgument, "The local GATT characteristic is not configured"));
+  if (!found->second.definition.properties.can_notify)
+    co_return Result::Failure(Error(Code::UnsupportedProperty, "The local characteristic does not support notifications"));
+  if (value.size() > max_gatt_attribute_value_size)
+    co_return Result::Failure(Error(Code::PayloadTooLarge, "The value exceeds the ATT attribute limit"));
+  Request request{.operation = Operation::SendNotification, .attribute = found->first, .value = std::move(value),
+                  .peripheral = session->id};
+  co_return Take<void>(co_await Run(session->service, std::move(request), options));
+}
+
+Task<BluetoothResult<AdvertisingSession>> Advertise(std::weak_ptr<Service> weak,
+    std::optional<std::weak_ptr<PeripheralSession>> server, AdvertisingOptions advertisement,
+    OperationOptions options, std::function<void(PeripheralEndEvent)> on_end) {
+  using Result = BluetoothResult<AdvertisingSession>;
+  if (!NormalizeUuids(advertisement.service_uuids) ||
+      (advertisement.local_name && (advertisement.local_name->empty() ||
+                                    advertisement.local_name->find('\0') != std::string::npos)) ||
+      (advertisement.service_uuids.empty() && !advertisement.local_name)) {
+    co_return Result::Failure(Error(Code::InvalidArgument, "Invalid advertising payload"));
+  }
+  std::ranges::sort(advertisement.service_uuids);
+  if (std::ranges::adjacent_find(advertisement.service_uuids) != advertisement.service_uuids.end())
+    co_return Result::Failure(Error(Code::InvalidArgument, "Duplicate advertised service UUID"));
+  if (UseApplication().LifecycleState() != ApplicationLifecycleState::Active)
+    co_return Result::Failure(Error(Code::Canceled, "Advertising requires an active application"));
+  auto service = weak.lock();
+  if (!service)
+    co_return Result::Failure(Error(Code::Unavailable, "Bluetooth service closed"));
+  Token server_id = 0;
+  if (server) {
+    auto configured = server->lock();
+    if (!configured || configured->ended || !configured->acquired)
+      co_return Result::Failure(Error(Code::Disconnected, "The local GATT server is closed"));
+    if (configured->service.lock() != service || advertisement.connectable == false ||
+        advertisement.service_uuids.empty()) {
+      co_return Result::Failure(Error(Code::InvalidArgument, "Invalid service-associated advertisement"));
+    }
+    for (const auto& uuid : advertisement.service_uuids) {
+      if (std::ranges::none_of(configured->attributes, [&](const auto& item) { return item.second.service_uuid == uuid; }))
+        co_return Result::Failure(Error(Code::InvalidArgument, "An advertised service is absent from the local server"));
+    }
+    server_id = configured->id;
+  }
+  auto session = NewPeripheral(*service, Operation::Advertise, server_id, std::move(on_end));
+  service->peripherals.emplace(session->id, session);
+  service.reset();
+  auto owner = Access::MakeAdvertisement(session);
+  Request request{.operation = Operation::Advertise, .peripheral = session->id, .server = server_id,
+                  .advertisement = std::move(advertisement)};
+  auto result = co_await Run(weak, std::move(request), options);
+  if (!result.Succeeded())
+    co_return Result::Failure(std::move(result).Error());
+  if (session->ended)
+    co_return Result::Failure(PeripheralStopped(*session));
+  session->acquired = true;
+  co_return Result::Success(std::move(owner));
+}
+
+void ReleasePeripheral(const std::shared_ptr<PeripheralSession>& session, bool notify) {
+  if (!session)
+    return;
+  if (!notify)
+    session->on_end.reset();
+  if (auto service = session->service.lock())
+    service->EndPeripheral(session->id, PeripheralEndReason::Stopped);
 }
 
 Task<BluetoothResult<Device>> AwaitSelection(std::weak_ptr<Service> weak, std::shared_ptr<Selection> selection) {
@@ -1129,6 +1471,54 @@ void GattSession::Disconnect() noexcept {
   detail::ReleaseSession(session_, true);
 }
 
+GattServerSession::GattServerSession(std::shared_ptr<detail::PeripheralSession> session)
+    : session_(std::move(session)) {}
+
+GattServerSession::GattServerSession(GattServerSession&& other) noexcept = default;
+
+GattServerSession& GattServerSession::operator=(GattServerSession&& other) noexcept {
+  if (this != &other) {
+    detail::ReleasePeripheral(session_, false);
+    session_ = std::move(other.session_);
+  }
+  return *this;
+}
+
+GattServerSession::~GattServerSession() {
+  detail::ReleasePeripheral(session_, false);
+}
+
+Task<BluetoothResult<void>> GattServerSession::NotifyAsync(std::string service_uuid, std::string characteristic_uuid,
+                                                          Bytes value, OperationOptions options) {
+  return detail::SendNotification(session_, std::move(service_uuid), std::move(characteristic_uuid),
+                                  std::move(value), options);
+}
+
+void GattServerSession::Stop() noexcept {
+  detail::ReleasePeripheral(session_, true);
+}
+
+AdvertisingSession::AdvertisingSession(std::shared_ptr<detail::PeripheralSession> session)
+    : session_(std::move(session)) {}
+
+AdvertisingSession::AdvertisingSession(AdvertisingSession&& other) noexcept = default;
+
+AdvertisingSession& AdvertisingSession::operator=(AdvertisingSession&& other) noexcept {
+  if (this != &other) {
+    detail::ReleasePeripheral(session_, false);
+    session_ = std::move(other.session_);
+  }
+  return *this;
+}
+
+AdvertisingSession::~AdvertisingSession() {
+  detail::ReleasePeripheral(session_, false);
+}
+
+void AdvertisingSession::Stop() noexcept {
+  detail::ReleasePeripheral(session_, true);
+}
+
 Bluetooth::Bluetooth(std::shared_ptr<detail::Service> service) : service_(std::move(service)) {}
 
 BluetoothCapabilities Bluetooth::Capabilities() const {
@@ -1258,6 +1648,23 @@ Task<BluetoothResult<GattConnection>> Bluetooth::ConnectWithRetryAsync(
     std::function<void(GattEvent)> on_event) {
   return detail::ConnectWithRetry(service_, std::move(device), options, std::move(restore_subscriptions),
                                   std::move(on_event));
+}
+
+Task<BluetoothResult<GattServerSession>> Bluetooth::OpenGattServerAsync(
+    std::vector<LocalGattService> services, OperationOptions options, std::function<void(PeripheralEndEvent)> on_end) {
+  return detail::OpenServer(service_, std::move(services), options, std::move(on_end));
+}
+
+Task<BluetoothResult<AdvertisingSession>> Bluetooth::StartAdvertisingAsync(
+    AdvertisingOptions advertisement, OperationOptions options, std::function<void(PeripheralEndEvent)> on_end) {
+  return detail::Advertise(service_, std::nullopt, std::move(advertisement), options, std::move(on_end));
+}
+
+Task<BluetoothResult<AdvertisingSession>> Bluetooth::StartAdvertisingAsync(
+    const GattServerSession& server, AdvertisingOptions advertisement, OperationOptions options,
+    std::function<void(PeripheralEndEvent)> on_end) {
+  return detail::Advertise(service_, std::weak_ptr<detail::PeripheralSession>(Access::Get(server)),
+                           std::move(advertisement), options, std::move(on_end));
 }
 
 void Install(ApplicationContext& context) {

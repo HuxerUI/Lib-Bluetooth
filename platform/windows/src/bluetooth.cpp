@@ -12,6 +12,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstring>
 #include <span>
@@ -100,6 +101,372 @@ Reply GattResult(GattCommunicationStatus status, const IReference<std::uint8_t>&
                                   "GattCommunicationStatus", static_cast<int>(status)));
   }
 }
+
+using WinError = winrt::Windows::Devices::Bluetooth::BluetoothError;
+using ProviderStatus = GattServiceProviderAdvertisementStatus;
+
+BluetoothError ProviderError(WinError error, const char* message) {
+  auto code = Code::PlatformFailure;
+  switch (error) {
+    case WinError::RadioNotAvailable: code = Code::Unavailable; break;
+    case WinError::ResourceInUse: code = Code::Busy; break;
+    case WinError::DisabledByPolicy:
+    case WinError::DisabledByUser:
+    case WinError::ConsentRequired: code = Code::PermissionDenied; break;
+    case WinError::NotSupported:
+    case WinError::TransportNotSupported: code = Code::Unsupported; break;
+    default: break;
+  }
+  return Error(code, message, "Windows BluetoothError", static_cast<int>(error));
+}
+
+struct AttDeferral {
+  Deferral value{nullptr};
+
+  ~AttDeferral() {
+    if (value) {
+      try {
+        value.Complete();
+      } catch (const winrt::hresult_error&) {
+        // The peer can disconnect before its request is answered.
+      }
+    }
+  }
+};
+
+struct LocalAttribute {
+  GattLocalCharacteristic characteristic{nullptr};
+  std::optional<winrt::event_token> read;
+  std::optional<winrt::event_token> write;
+  std::optional<winrt::event_token> subscription;
+  bool subscribed = false;
+};
+
+class LocalServer final : public std::enable_shared_from_this<LocalServer> {
+public:
+  LocalServer(TaskScope tasks, BackendEvents events, Token id, std::string uuid)
+      : tasks_(std::move(tasks)), events_(std::move(events)), id_(id), uuid_(std::move(uuid)) {}
+
+  ~LocalServer() { Close(); }
+
+  Token Id() const { return id_; }
+
+  static winrt::fire_and_forget Open(std::shared_ptr<LocalServer> server, ServerService definition,
+                                     Completion completion) {
+    try {
+      const auto uuid = winrt::guid{std::string_view(definition.uuid)};
+      auto result = co_await GattServiceProvider::CreateAsync(uuid);
+      if (server->closed_)
+        co_return;
+      if (result.Error() != WinError::Success) {
+        completion(Reply::Failure(ProviderError(result.Error(), "Windows could not configure the local service")));
+        co_return;
+      }
+      server->provider_ = result.ServiceProvider();
+      for (const auto& item : definition.characteristics) {
+        WinProperties properties = WinProperties::None;
+        if (item.properties.can_read)
+          properties |= WinProperties::Read;
+        if (item.properties.can_write_with_response)
+          properties |= WinProperties::Write;
+        if (item.properties.can_notify)
+          properties |= WinProperties::Notify;
+        GattLocalCharacteristicParameters parameters;
+        parameters.CharacteristicProperties(properties);
+        auto created = co_await server->provider_.Service().CreateCharacteristicAsync(
+            winrt::guid{std::string_view(item.uuid)}, parameters);
+        if (server->closed_)
+          co_return;
+        if (created.Error() != WinError::Success) {
+          completion(Reply::Failure(ProviderError(created.Error(), "Windows could not configure the local characteristic")));
+          co_return;
+        }
+        server->Register(item, created.Characteristic());
+      }
+      completion(Ok());
+    } catch (const winrt::hresult_error& error) {
+      if (!server->closed_)
+        completion(Reply::Failure(WindowsError(error)));
+    }
+  }
+
+  void Advertise(const Request& request, Completion completion) {
+    if (!provider_ || closed_) {
+      completion(Fail(Code::Disconnected, "The local GATT server is closed"));
+      return;
+    }
+    if (request.advertisement.local_name || request.advertisement.service_uuids != std::vector<std::string>{uuid_}) {
+      completion(Fail(Code::Unsupported, "Windows can advertise only the configured service UUID and system name"));
+      return;
+    }
+    if (advertisement_) {
+      completion(Fail(Code::Busy, "A Windows GATT advertisement is already active or stopping"));
+      return;
+    }
+    const auto id = request.peripheral;
+    advertisement_ = id;
+    advertising_ = std::move(completion);
+    try {
+      status_listener_ = provider_.AdvertisementStatusChanged(
+          [weak = weak_from_this(), tasks = tasks_, id](const GattServiceProvider&,
+                                                const GattServiceProviderAdvertisementStatusChangedEventArgs& info) {
+        const auto status = info.Status();
+        const auto error = info.Error();
+        tasks.Post([weak, id, status, error] {
+          if (auto server = weak.lock())
+            server->AdvertisingStatus(id, status, error);
+        });
+      });
+      GattServiceProviderAdvertisingParameters options;
+      options.IsConnectable(true);
+      options.IsDiscoverable(true);
+      provider_.StartAdvertising(options);
+    } catch (const winrt::hresult_error& error) {
+      auto failed = std::exchange(advertising_, {});
+      ReleaseAdvertisement();
+      failed(Reply::Failure(WindowsError(error)));
+    }
+  }
+
+  void StopAdvertising(Token id) {
+    if (id == 0 || advertisement_ != id || stopping_)
+      return;
+    stopping_ = true;
+    advertising_ = {};
+    Unpublish();
+    try {
+      provider_.StopAdvertising();
+      const auto status = provider_.AdvertisementStatus();
+      if (status == ProviderStatus::Created || status == ProviderStatus::Stopped || status == ProviderStatus::Aborted)
+        ReleaseAdvertisement();
+    } catch (const winrt::hresult_error&) {
+      ReleaseAdvertisement();
+    }
+  }
+
+  Cancellation Notify(Token id, const Bytes& value, Completion completion) {
+    if (publication_.load() == 0) {
+      completion(Fail(Code::Unavailable, "The Windows GATT service is not published"));
+      return {};
+    }
+    const auto found = attributes_.find(id);
+    if (found == attributes_.end()) {
+      completion(Fail(Code::InvalidArgument, "Unknown local GATT characteristic"));
+      return {};
+    }
+    try {
+      const auto& characteristic = found->second.characteristic;
+      const auto peers = characteristic.SubscribedClients();
+      if (peers.Size() == 0) {
+        completion(Ok());
+        return {};
+      }
+      for (const auto& peer : peers) {
+        if (value.size() > peer.MaxNotificationSize()) {
+          completion(Fail(Code::PayloadTooLarge, "The notification exceeds a subscribed peer's update size"));
+          return {};
+        }
+      }
+      auto operation = characteristic.NotifyValueAsync(ToBuffer(value));
+      FinishNotification(operation, std::move(completion));
+      return [operation] {
+        try {
+          operation.Cancel();
+        } catch (const winrt::hresult_error&) {
+          // The platform already completed the update.
+        }
+      };
+    } catch (const winrt::hresult_error& error) {
+      completion(Reply::Failure(WindowsError(error)));
+      return {};
+    }
+  }
+
+  void Close() {
+    if (std::exchange(closed_, true))
+      return;
+    StopAdvertising(advertisement_);
+    ReleaseAdvertisement();
+    for (const auto& [id, attribute] : attributes_) {
+      if (attribute.read)
+        attribute.characteristic.ReadRequested(*attribute.read);
+      if (attribute.write)
+        attribute.characteristic.WriteRequested(*attribute.write);
+      if (attribute.subscription)
+        attribute.characteristic.SubscribedClientsChanged(*attribute.subscription);
+    }
+    attributes_.clear();
+    provider_ = nullptr;
+  }
+
+private:
+  void Register(const ServerCharacteristic& definition, const GattLocalCharacteristic& characteristic) {
+    const auto id = definition.id;
+    auto& attribute = attributes_.emplace(id, LocalAttribute{characteristic}).first->second;
+    if (definition.properties.can_read) {
+      attribute.read = characteristic.ReadRequested(
+          [weak = weak_from_this(), tasks = tasks_, id](const GattLocalCharacteristic&,
+                                                       const GattReadRequestedEventArgs& args) {
+        Dispatch(weak, tasks, id, args);
+      });
+    }
+    if (definition.properties.can_write_with_response) {
+      attribute.write = characteristic.WriteRequested(
+          [weak = weak_from_this(), tasks = tasks_, id](const GattLocalCharacteristic&,
+                                                       const GattWriteRequestedEventArgs& args) {
+        Dispatch(weak, tasks, id, args);
+      });
+    }
+    if (definition.properties.can_notify) {
+      attribute.subscription = characteristic.SubscribedClientsChanged(
+          [weak = weak_from_this(), tasks = tasks_, id](const GattLocalCharacteristic& source, const IInspectable&) {
+        tasks.Post([weak, id, source] {
+          auto server = weak.lock();
+          if (!server || server->publication_.load() == 0)
+            return;
+          try {
+            auto& local = server->attributes_.at(id);
+            const bool enabled = source.SubscribedClients().Size() != 0;
+            if (std::exchange(local.subscribed, enabled) != enabled)
+              server->events_(ServerSubscription{server->id_, id, enabled});
+          } catch (const winrt::hresult_error&) {
+            // The platform already withdrew the characteristic.
+          }
+        });
+      });
+    }
+  }
+
+  template <class Args>
+  static winrt::fire_and_forget Dispatch(std::weak_ptr<LocalServer> weak, TaskScope tasks, Token id, Args args) {
+    constexpr bool write = std::is_same_v<Args, GattWriteRequestedEventArgs>;
+    try {
+      Token publication = 0;
+      if (auto server = weak.lock())
+        publication = server->publication_.load();
+      const auto deferral = std::make_shared<AttDeferral>();
+      deferral->value = args.GetDeferral();
+      auto request = co_await args.GetRequestAsync();
+      if (!request)
+        co_return;
+      if constexpr (write) {
+        if (request.Option() != GattWriteOption::WriteWithResponse)
+          co_return;
+      }
+      tasks.Post([weak, id, request, deferral, publication] {
+        auto server = weak.lock();
+        try {
+          if (!server || publication == 0 || server->publication_.load() != publication) {
+            request.RespondWithProtocolError(static_cast<std::uint8_t>(AttStatus::UnlikelyError));
+            return;
+          }
+          Bytes value;
+          std::optional<std::size_t> limit;
+          if constexpr (write)
+            value = BufferBytes(request.Value());
+          else
+            limit = request.Length();
+          auto current = [weak, publication] {
+            const auto server = weak.lock();
+            return server && server->publication_.load() == publication;
+          };
+          server->events_(ServerRequest{server->id_, id, write, request.Offset(), std::move(value), limit,
+                                         [current, request, deferral](AttStatus status, Bytes response) {
+            try {
+              if (!current())
+                status = AttStatus::UnlikelyError;
+              if (status != AttStatus::Success) {
+                request.RespondWithProtocolError(static_cast<std::uint8_t>(status));
+              } else if constexpr (write) {
+                request.Respond();
+              } else {
+                request.RespondWithValue(ToBuffer(response));
+              }
+            } catch (const winrt::hresult_error&) {
+              // The peer can disconnect before its request is answered.
+            }
+          }, current});
+        } catch (const winrt::hresult_error&) {
+          // The platform retired the request before dispatch.
+        }
+      });
+    } catch (const winrt::hresult_error&) {
+      // The platform retired the request before it could be acquired.
+    }
+  }
+
+  static winrt::fire_and_forget FinishNotification(
+      IAsyncOperation<winrt::Windows::Foundation::Collections::IVectorView<GattClientNotificationResult>> operation,
+      Completion completion) {
+    try {
+      auto results = co_await operation;
+      for (const auto& result : results) {
+        if (result.Status() != GattCommunicationStatus::Success) {
+          completion(GattResult(result.Status(), result.ProtocolError()));
+          co_return;
+        }
+      }
+      completion(Ok());
+    } catch (const winrt::hresult_error& error) {
+      completion(Reply::Failure(WindowsError(error)));
+    }
+  }
+
+  void AdvertisingStatus(Token id, ProviderStatus status, WinError error) {
+    if (advertisement_ != id)
+      return;
+    if (stopping_) {
+      if (status == ProviderStatus::Stopped || status == ProviderStatus::Aborted)
+        ReleaseAdvertisement();
+      return;
+    }
+    if (status == ProviderStatus::Started) {
+      publication_.store(id);
+      if (auto completion = std::exchange(advertising_, {}))
+        completion(Ok());
+      return;
+    }
+    if (status == ProviderStatus::Created)
+      return;
+    auto failure = status == ProviderStatus::StartedWithoutAllAdvertisementData
+                       ? Error(Code::PayloadTooLarge, "Windows omitted requested advertising data")
+                       : ProviderError(error, "Windows stopped the GATT advertisement");
+    if (auto completion = std::exchange(advertising_, {}))
+      completion(Reply::Failure(std::move(failure)));
+    else
+      events_(PeripheralFailure{id, std::move(failure)});
+    StopAdvertising(id);
+  }
+
+  void Unpublish() {
+    if (publication_.exchange(0) == 0)
+      return;
+    for (auto& [id, attribute] : attributes_) {
+      if (std::exchange(attribute.subscribed, false))
+        events_(ServerSubscription{id_, id, false});
+    }
+  }
+
+  void ReleaseAdvertisement() {
+    advertisement_ = 0;
+    stopping_ = false;
+    if (auto token = std::exchange(status_listener_, {}))
+      provider_.AdvertisementStatusChanged(*token);
+  }
+
+  TaskScope tasks_;
+  BackendEvents events_;
+  Token id_;
+  std::string uuid_;
+  GattServiceProvider provider_{nullptr};
+  std::map<Token, LocalAttribute> attributes_;
+  std::optional<winrt::event_token> status_listener_;
+  Completion advertising_;
+  Token advertisement_ = 0;
+  std::atomic<Token> publication_{0};
+  bool stopping_ = false;
+  bool closed_ = false;
+};
 
 Reply PairResult(DevicePairingResultStatus result) {
   Code code = Code::AuthenticationFailed;
@@ -250,6 +617,8 @@ struct State : std::enable_shared_from_this<State> {
       auto radio = co_await adapter.GetRadioAsync();
       if (state->disposed || !radio)
         co_return;
+      state->supports_peripheral = adapter.IsPeripheralRoleSupported() &&
+          ApiInformation::IsTypePresent(L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProvider");
       state->radio = radio;
       state->radio_token = radio.StateChanged([weak = state->weak_from_this(), tasks = state->tasks](auto&&, auto&&) {
         tasks.Post([weak] {
@@ -605,6 +974,7 @@ struct State : std::enable_shared_from_this<State> {
   TaskScope tasks;
   BackendEvents events;
   bool disposed = false;
+  bool supports_peripheral = false;
   AdapterStatus status = AdapterStatus::Unknown;
   Radio radio{nullptr};
   std::optional<winrt::event_token> radio_token;
@@ -627,6 +997,8 @@ public:
   }
 
   ~WindowsBackend() override {
+    if (local_)
+      local_->Close();
     state_->Dispose();
   }
 
@@ -634,8 +1006,55 @@ public:
     return state_->status;
   }
 
+  BluetoothCapabilities PeripheralCapabilities() const override {
+    return {.can_advertise = state_->supports_peripheral, .can_use_gatt_server = state_->supports_peripheral};
+  }
+
   Cancellation Invoke(Request request, Completion complete) override {
+    if (request.operation == Operation::OpenServer) {
+      if (request.local_services.size() != 1) {
+        complete(Fail(Code::Unsupported, "The Windows backend supports one local primary service per server"));
+      } else if (local_) {
+        complete(Fail(Code::Busy, "A Windows GATT server is already open"));
+      } else {
+        auto service = std::move(request.local_services.front());
+        const auto id = request.peripheral;
+        local_ = std::make_shared<LocalServer>(state_->tasks, state_->events, id, service.uuid);
+        LocalServer::Open(local_, std::move(service), std::move(complete));
+        return [this, id] { CloseServer(id); };
+      }
+      return {};
+    }
+    if (request.operation == Operation::Advertise) {
+      if (!local_ || local_->Id() != request.server) {
+        complete(Fail(Code::Disconnected, "The local GATT server is closed"));
+        return {};
+      }
+      auto weak = std::weak_ptr<LocalServer>(local_);
+      const auto id = request.peripheral;
+      local_->Advertise(request, std::move(complete));
+      return [weak, id] {
+        if (auto server = weak.lock())
+          server->StopAdvertising(id);
+      };
+    }
+    if (request.operation == Operation::SendNotification) {
+      if (local_ && local_->Id() == request.peripheral)
+        return local_->Notify(request.attribute, request.value, std::move(complete));
+      complete(Fail(Code::Disconnected, "The local GATT server is closed"));
+      return {};
+    }
     return state_->Invoke(std::move(request), std::move(complete));
+  }
+
+  void StopAdvertising(Token id) override {
+    if (local_)
+      local_->StopAdvertising(id);
+  }
+
+  void CloseServer(Token id) override {
+    if (local_ && local_->Id() == id)
+      std::exchange(local_, {})->Close();
   }
 
   void StopScan(Token scan) override {
@@ -648,6 +1067,7 @@ public:
 
 private:
   std::shared_ptr<State> state_;
+  std::shared_ptr<LocalServer> local_;
 };
 
 } // namespace

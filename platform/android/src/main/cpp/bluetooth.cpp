@@ -1,6 +1,7 @@
 #include "backend.h"
 
 #include <huxerui/android/platform_registry.h>
+#include <huxerui/state.h>
 
 #include <utility>
 
@@ -35,11 +36,39 @@ const char* Method(Operation operation) {
     case Operation::Read: return "read";
     case Operation::Write: return "write";
     case Operation::Notify: return "notify";
+    case Operation::Advertise: return "advertise";
+    case Operation::OpenServer: return "open_server";
+    case Operation::SendNotification: return "send_notification";
   }
   throw std::logic_error("Unknown Android Bluetooth operation");
 }
 
 PlatformPayload Encode(const Request& request) {
+  if (IsPeripheralOperation(request.operation)) {
+    PlatformPayload::List services;
+    for (const auto& uuid : request.advertisement.service_uuids)
+      services.emplace_back(uuid);
+    PlatformPayload::List local_services;
+    for (const auto& service : request.local_services) {
+      PlatformPayload::List characteristics;
+      for (const auto& attribute : service.characteristics) {
+        const auto props = attribute.properties;
+        const int flags = (props.can_read ? 2 : 0) | (props.can_write_with_response ? 8 : 0) |
+                          (props.can_notify ? 16 : 0);
+        characteristics.emplace_back(PlatformPayload::Object{
+            {"id", attribute.id}, {"uuid", attribute.uuid}, {"properties", flags}});
+      }
+      local_services.emplace_back(PlatformPayload::Object{
+          {"uuid", service.uuid}, {"characteristics", std::move(characteristics)}});
+    }
+    return PlatformPayload::Object{
+        {"peripheral", request.peripheral}, {"attribute", request.attribute}, {"value", request.value},
+        {"services", std::move(services)}, {"local_services", std::move(local_services)},
+        {"local_name", request.advertisement.local_name ? PlatformPayload(*request.advertisement.local_name)
+                                                        : PlatformPayload{}},
+        {"connectable", request.advertisement.connectable ? PlatformPayload(*request.advertisement.connectable)
+                                                            : PlatformPayload{}}};
+  }
   PlatformPayload::List services;
   for (const auto& uuid : request.advertised_services)
     services.emplace_back(uuid);
@@ -136,16 +165,29 @@ Reply Decode(Operation operation, const PlatformPayload& value) {
 
 struct Bridge {
   AdapterStatus status = AdapterStatus::Unknown;
+  State<BluetoothCapabilities> peripheral{BluetoothCapabilities{}};
   BackendEvents events;
 
-  void Receive(const PlatformPayload& value) {
+  void Status(const PlatformPayload& value) {
+    const auto& object = value.AsObject();
+    const auto& flags = object.at("peripheral").AsObject();
+    const bool advertising = flags.at("advertise").AsBoolean();
+    const bool server = flags.at("server").AsBoolean();
+    if (peripheral->can_advertise != advertising || peripheral->can_use_gatt_server != server) {
+      peripheral = BluetoothCapabilities{.can_advertise = advertising, .can_use_gatt_server = server,
+                                         .can_advertise_standalone = advertising};
+    }
+    status = static_cast<AdapterStatus>(object.at("status").AsInteger());
+    events(status);
+  }
+
+  void Receive(const PlatformChannel& channel, const PlatformPayload& value) {
     const auto& object = value.AsObject();
     const auto type = object.at("type").AsString();
     const auto token = static_cast<Token>(object.at("token").AsInteger());
     const auto& data = object.at("data");
     if (type == "status") {
-      status = static_cast<AdapterStatus>(data.AsInteger());
-      events(status);
+      Status(data);
     } else if (type == "scan") {
       const auto& fields = data.AsObject();
       Advertisement advertisement;
@@ -164,12 +206,14 @@ struct Bridge {
       if (!fields.at("connectable").IsNull())
         advertisement.connectable = fields.at("connectable").AsBoolean();
       events(ScanReport{token, ReadDevice(fields.at("device")), std::move(advertisement)});
-    } else if (type == "scan_error" || type == "link_lost") {
+    } else if (type == "scan_error" || type == "link_lost" || type == "peripheral_error") {
       const auto& fields = data.AsObject();
       auto error = AndroidError(fields.at("code").AsString(), std::string(fields.at("message").AsString()),
                                 fields.at("status"));
       if (type == "scan_error")
         events(ScanFailure{token, std::move(error)});
+      else if (type == "peripheral_error")
+        events(PeripheralFailure{token, std::move(error)});
       else
         events(LinkLost{token, std::move(error)});
     } else if (type == "services") {
@@ -179,6 +223,21 @@ struct Bridge {
     } else if (type == "value") {
       const auto& fields = data.AsObject();
       events(ValueChanged{token, static_cast<Token>(fields.at("attribute").AsInteger()), ReadBytes(fields.at("bytes"))});
+    } else if (type == "server_read" || type == "server_write") {
+      const auto& fields = data.AsObject();
+      const auto id = fields.at("request").AsInteger();
+      events(ServerRequest{token, static_cast<Token>(fields.at("attribute").AsInteger()), type == "server_write",
+                          static_cast<std::size_t>(fields.at("offset").AsInteger()), ReadBytes(fields.at("bytes")),
+                          static_cast<std::size_t>(fields.at("limit").AsInteger()),
+                          [channel, token, id](AttStatus status, Bytes bytes) {
+        channel.Invoke("server_response", PlatformPayload::Object{
+            {"peripheral", token}, {"request", id}, {"status", static_cast<int>(status)}, {"value", std::move(bytes)}},
+            [](PlatformResult<PlatformPayload>) {});
+      }});
+    } else if (type == "server_subscription") {
+      const auto& fields = data.AsObject();
+      events(ServerSubscription{token, static_cast<Token>(fields.at("attribute").AsInteger()),
+                                fields.at("subscribed").AsBoolean()});
     }
   }
 };
@@ -187,16 +246,14 @@ class AndroidBackend final : public Backend {
 public:
   AndroidBackend(PlatformChannel channel, BackendEvents events)
       : channel_(std::move(channel)), bridge_(std::make_shared<Bridge>(Bridge{.events = std::move(events)})) {
-    channel_.On<BluetoothEvent>([weak = std::weak_ptr<Bridge>(bridge_)](BluetoothEventPayload event) {
+    channel_.On<BluetoothEvent>([weak = std::weak_ptr<Bridge>(bridge_), channel = channel_](BluetoothEventPayload event) {
       if (auto bridge = weak.lock())
-        bridge->Receive(event.value);
+        bridge->Receive(channel, event.value);
     });
     channel_.Invoke("status", {}, [weak = std::weak_ptr<Bridge>(bridge_)](PlatformResult<PlatformPayload> result) {
       if (auto bridge = weak.lock()) {
-        if (const auto* value = std::get_if<PlatformPayload>(&result)) {
-          bridge->status = static_cast<AdapterStatus>(value->AsInteger());
-          bridge->events(bridge->status);
-        }
+        if (const auto* value = std::get_if<PlatformPayload>(&result))
+          bridge->Status(*value);
       }
     });
   }
@@ -208,6 +265,10 @@ public:
 
   AdapterStatus Status() const override {
     return bridge_->status;
+  }
+
+  BluetoothCapabilities PeripheralCapabilities() const override {
+    return bridge_->peripheral;
   }
 
   Cancellation Invoke(Request request, Completion completion) override {
@@ -233,6 +294,14 @@ public:
 
   void Disconnect(Token link) override {
     Control("disconnect", link);
+  }
+
+  void StopAdvertising(Token advertisement) override {
+    Control("stop_advertising", advertisement);
+  }
+
+  void CloseServer(Token server) override {
+    Control("close_server", server);
   }
 
 private:

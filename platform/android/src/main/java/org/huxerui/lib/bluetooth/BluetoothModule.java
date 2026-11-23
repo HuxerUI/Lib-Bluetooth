@@ -42,12 +42,13 @@ import java.util.UUID;
 
 @SuppressWarnings("deprecation")
 public final class BluetoothModule implements HuxerUIPlatformModule {
-    private static final UUID CLIENT_CONFIGURATION =
+    static final UUID CLIENT_CONFIGURATION =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-    private static final PlatformPayload EMPTY = PlatformPayload.nullValue();
+    static final PlatformPayload EMPTY = PlatformPayload.nullValue();
 
     private final Context context;
     private final BluetoothAdapter adapter;
+    private final Peripheral peripheral;
     private final HuxerUIPlatformChannel.Events events;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, BluetoothDevice> devices = new HashMap<>();
@@ -72,6 +73,7 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         this.events = events;
         BluetoothManager manager = this.context.getSystemService(BluetoothManager.class);
         adapter = manager == null ? null : manager.getAdapter();
+        peripheral = new Peripheral(this.context, adapter, handler, this::emit);
         IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
         filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
         if (Build.VERSION.SDK_INT >= 33) {
@@ -85,7 +87,7 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         @Override
         public void onReceive(Context ignored, Intent intent) {
             if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(intent.getAction())) {
-                emit("status", 0, number(status()));
+                emit("status", 0, statusPayload());
                 return;
             }
             BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
@@ -118,13 +120,30 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         return state == BluetoothAdapter.STATE_ON ? 3 : state == BluetoothAdapter.STATE_OFF ? 2 : 0;
     }
 
+    private PlatformPayload statusPayload() {
+        int current = status();
+        return object("status", number(current), "peripheral", peripheral.capabilities(current != 1));
+    }
+
     @Override
     public HuxerUIPlatformChannel.Cancellation invoke(
             String method, PlatformPayload args, HuxerUIPlatformChannel.Result result) {
         try {
             switch (method) {
                 case "status":
-                    result.complete(number(status()));
+                    result.complete(statusPayload());
+                    return null;
+                case "stop_advertising":
+                    peripheral.stopAdvertising(args.requireInt64());
+                    result.complete(EMPTY);
+                    return null;
+                case "close_server":
+                    peripheral.closeServer(args.requireInt64());
+                    result.complete(EMPTY);
+                    return null;
+                case "server_response":
+                    peripheral.respond(args);
+                    result.complete(EMPTY);
                     return null;
                 case "stop_scan":
                     stopScan(args.requireInt64());
@@ -144,6 +163,12 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
                 return null;
             }
             switch (method) {
+                case "advertise":
+                    return peripheral.startAdvertising(args, result);
+                case "open_server":
+                    return peripheral.openServer(args, result);
+                case "send_notification":
+                    return peripheral.notify(args, result);
                 case "scan":
                     startScan(args, result);
                     return null;
@@ -369,6 +394,7 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
     public void dispose() {
         context.unregisterReceiver(receiver);
         stopScan(scanToken);
+        peripheral.dispose();
         for (long id : new ArrayList<>(links.keySet())) {
             closeLink(id);
         }
@@ -755,7 +781,7 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         }
     }
 
-    private static byte[] copy(byte[] value) {
+    static byte[] copy(byte[] value) {
         return value == null ? new byte[0] : value.clone();
     }
 
@@ -763,19 +789,19 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         events.emit("bluetooth", object("type", text(type), "token", number(token), "data", data));
     }
 
-    private static PlatformPayload failure(String code, String message, int status) {
+    static PlatformPayload failure(String code, String message, int status) {
         return object("code", text("bluetooth/" + code), "message", text(message), "status", number(status));
     }
 
-    private static void fail(HuxerUIPlatformChannel.Result result, String code, String message, int status) {
+    static void fail(HuxerUIPlatformChannel.Result result, String code, String message, int status) {
         result.fail("bluetooth/" + code, message, number(status));
     }
 
-    private static long id(PlatformPayload object, String key) {
+    static long id(PlatformPayload object, String key) {
         return object.requireField(key).requireInt64();
     }
 
-    private static PlatformPayload number(long value) {
+    static PlatformPayload number(long value) {
         return PlatformPayload.int64(value);
     }
 
@@ -783,7 +809,7 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         return value == null ? EMPTY : PlatformPayload.string(value);
     }
 
-    private static PlatformPayload object(Object... fields) {
+    static PlatformPayload object(Object... fields) {
         Map<String, PlatformPayload> values = new HashMap<>();
         for (int index = 0; index < fields.length; index += 2) {
             values.put((String) fields[index], (PlatformPayload) fields[index + 1]);

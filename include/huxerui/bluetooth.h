@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file
-/// @brief Foreground Bluetooth LE discovery, pairing, and GATT client operations for HuxerUI.
+/// @brief Foreground Bluetooth LE discovery, pairing, advertising, and GATT operations for HuxerUI.
 ///
 /// Link HuxerUI::Bluetooth and register bluetooth::Install through the application hooks. Use the returned session
 /// handles to control operation lifetimes. Applications supply their permission declarations and request access.
@@ -28,6 +28,7 @@ namespace detail {
 struct Access;
 struct Attribute;
 struct DeviceData;
+struct PeripheralSession;
 struct Scan;
 struct Service;
 struct Session;
@@ -94,7 +95,7 @@ template <class T> using BluetoothResult = Result<T, BluetoothError>;
 /// @brief Deadline for a queued or executing asynchronous operation, measured from Task start.
 struct OperationOptions {
   /// Maximum time for queueing and execution. The timeout must be positive.
-  /// System interaction already in progress can outlive this deadline. If an active GATT request reaches the
+  /// System interaction already in progress can outlive this deadline. If an active GATT client request reaches the
   /// deadline, the library closes the logical session. Connect again before issuing further GATT requests.
   std::chrono::milliseconds timeout = std::chrono::seconds{30};
 };
@@ -139,10 +140,12 @@ struct BluetoothCapabilities {
   bool can_use_gatt_client = false;
   /// Supports descriptor access when the discovered attribute and its permissions allow it.
   bool can_access_descriptors = false;
-  /// Reports support for BLE advertising. Always false in this release.
+  /// Supports at least one BLE advertising path on the current backend and adapter.
   bool can_advertise = false;
-  /// Reports support for a local GATT server. Always false in this release.
+  /// Supports configuring a local GATT server through OpenGattServerAsync().
   bool can_use_gatt_server = false;
+  /// Supports BLE advertising independently of an open local GATT server.
+  bool can_advertise_standalone = false;
 };
 
 /// @brief A discovered, selected, or restored device owned by the original application backend.
@@ -461,6 +464,119 @@ struct GattConnection {
 using RestoreSubscriptions = std::function<Task<BluetoothResult<std::vector<GattSubscription>>>(
     GattSession&, std::span<const GattService>)>;
 
+/// @brief Normal termination of one advertising or server session.
+enum class PeripheralEndReason {
+  /// The application stopped the session or its associated server.
+  Stopped,
+  /// Foreground operation ended when the application entered the background.
+  Backgrounded,
+};
+
+/// @brief A normal stop or a terminal error reported by the session.
+using PeripheralEndEvent = std::variant<PeripheralEndReason, BluetoothError>;
+
+/// @brief Rejection to send for an incoming attribute request.
+enum class GattRequestError {
+  /// The application declined the requested read or write.
+  NotPermitted,
+  /// The requested value length is incompatible with the characteristic.
+  InvalidValueLength,
+  /// The application could not produce a value or accept the write.
+  UnlikelyError,
+};
+
+/// @brief Definition and request handlers for one local characteristic.
+struct LocalGattCharacteristic {
+  /// UUID within the enclosing service.
+  std::string uuid;
+
+  /// Properties to expose. The first release supports read, write with response, and notify.
+  GattCharacteristicProperties properties;
+
+  /// Returns the complete current value for one ATT read request, including a read at a nonzero offset.
+  /// A later request for the same characteristic can obtain a newer value.
+  std::function<Result<Bytes, GattRequestError>()> on_read;
+
+  /// Accepts or rejects one complete replacement value from a remote write.
+  std::function<Result<void, GattRequestError>(Bytes)> on_write;
+
+  /// Reports changes in whether the characteristic has any subscribed peers, starting with none.
+  std::function<void(bool has_subscribers)> on_subscription_changed;
+};
+
+/// @brief Definition of one primary service on the local GATT server.
+struct LocalGattService {
+  /// UUID unique within the enclosing server.
+  std::string uuid;
+
+  /// Characteristics to publish in this service.
+  std::vector<LocalGattCharacteristic> characteristics;
+};
+
+/// @brief Unique owner of a local GATT server and its service definitions.
+/// Use and destroy this handle on the owning application thread. Destruction retires the local services and
+/// associated advertising, and suppresses this server's queued terminal event.
+class GattServerSession final {
+public:
+  GattServerSession(GattServerSession&& other) noexcept;
+
+  GattServerSession& operator=(GattServerSession&& other) noexcept;
+
+  ~GattServerSession();
+
+  /// @brief Submits a value update to the characteristic's subscribed peers.
+  /// @param service_uuid UUID of a service configured by this session.
+  /// @param characteristic_uuid UUID of the notification characteristic within the service.
+  /// @param value Owned update bytes.
+  /// @param options Deadline for accepting and submitting the update.
+  /// @return Success when the platform accepts the update or the published characteristic has no subscribers.
+  /// An unavailable publication, rejected update, or deadline returns an operation error.
+  Task<BluetoothResult<void>> NotifyAsync(std::string service_uuid, std::string characteristic_uuid,
+                                         Bytes value, OperationOptions options = {});
+
+  /// @brief Retires the local services. Retain the handle to receive the terminal event.
+  void Stop() noexcept;
+
+private:
+  explicit GattServerSession(std::shared_ptr<detail::PeripheralSession> session);
+
+  std::shared_ptr<detail::PeripheralSession> session_;
+  friend struct detail::Access;
+};
+
+/// @brief Payload and connectability requested for one foreground advertisement.
+struct AdvertisingOptions {
+  /// Service UUIDs to advertise. Accepts the same UUID formats as ScanOptions.
+  std::vector<std::string> service_uuids;
+
+  /// Requested local name, subject to the platform's advertising rules.
+  std::optional<std::string> local_name;
+
+  /// Requested connectability. An empty value uses the default for the selected overload.
+  std::optional<bool> connectable;
+};
+
+/// @brief Unique owner of one foreground advertisement.
+/// Use and destroy this handle on the owning application thread. Destruction stops advertising and suppresses
+/// its queued terminal event.
+class AdvertisingSession final {
+public:
+  AdvertisingSession(AdvertisingSession&& other) noexcept;
+
+  AdvertisingSession& operator=(AdvertisingSession&& other) noexcept;
+
+  ~AdvertisingSession();
+
+  /// @brief Stops this advertisement. Retain the handle to receive the terminal event.
+  void Stop() noexcept;
+
+private:
+  explicit AdvertisingSession(std::shared_ptr<detail::PeripheralSession> session);
+
+  std::shared_ptr<detail::PeripheralSession> session_;
+  friend struct detail::Access;
+};
+
 /// @brief Application-scoped entry point for nearby Bluetooth devices.
 /// Call its methods on the owning application thread, and launch operations from an event or committed lifecycle.
 /// @code{.cpp}
@@ -588,6 +704,62 @@ public:
   Task<BluetoothResult<GattConnection>> ConnectWithRetryAsync(
       Device device, ReconnectOptions options = {}, RestoreSubscriptions restore_subscriptions = {},
       std::function<void(GattEvent)> on_event = {});
+
+  /// @brief Opens a local GATT server with the supplied primary services and handlers.
+  /// Launch while the application is active. Request handlers run synchronously on the owning application thread.
+  /// @param services Owned service definitions and callbacks.
+  /// @param options Deadline for opening the server.
+  /// @param on_end Optional terminal callback for an acquired server session.
+  /// @return A server with its configuration ready, or an operation error. Platforms that publish through
+  /// advertising require the associated StartAdvertisingAsync() overload before serving requests.
+  /// @code{.cpp}
+  /// auto opened = co_await bluetooth->OpenGattServerAsync(MakeLocalServices());
+  /// if (!opened.Succeeded()) {
+  ///   ShowBluetoothError(opened.Error());
+  ///   co_return;
+  /// }
+  /// auto server = std::move(opened).Value();
+  /// AdvertisingOptions advertisement{.service_uuids = {service_uuid}};
+  /// auto started = co_await bluetooth->StartAdvertisingAsync(server, std::move(advertisement));
+  /// if (started.Succeeded()) {
+  ///   StorePeripheral(std::move(server), std::move(started).Value());
+  /// } else {
+  ///   ShowBluetoothError(started.Error());
+  /// }
+  /// @endcode
+  Task<BluetoothResult<GattServerSession>> OpenGattServerAsync(
+      std::vector<LocalGattService> services, OperationOptions options = {},
+      std::function<void(PeripheralEndEvent)> on_end = {});
+
+  /// @brief Starts a standalone advertisement when the Task runs.
+  /// Launch while the application is active. Acquired sessions retire when the application enters the background.
+  /// @param advertisement Service UUIDs, name, and connectability requested for the advertisement.
+  /// @param options Deadline for startup.
+  /// @param on_end Optional terminal callback for an acquired advertising session.
+  /// @return An active advertising session or an operation error.
+  /// @code{.cpp}
+  /// AdvertisingOptions advertisement{.service_uuids = {service_uuid}};
+  /// auto started = co_await bluetooth->StartAdvertisingAsync(std::move(advertisement));
+  /// if (started.Succeeded()) {
+  ///   StoreAdvertisement(std::move(started).Value());
+  /// } else {
+  ///   ShowBluetoothError(started.Error());
+  /// }
+  /// @endcode
+  Task<BluetoothResult<AdvertisingSession>> StartAdvertisingAsync(
+      AdvertisingOptions advertisement, OperationOptions options = {},
+      std::function<void(PeripheralEndEvent)> on_end = {});
+
+  /// @brief Starts advertising services configured by a local GATT server.
+  /// @param server Open server on this application and adapter. The Task captures the server identity during this
+  /// call. Retain the server for the duration of the advertisement.
+  /// @param advertisement The local service UUIDs to advertise and any supported payload options.
+  /// @param options Deadline for startup.
+  /// @param on_end Optional terminal callback for an acquired advertising session.
+  /// @return An active advertising session or an operation error.
+  Task<BluetoothResult<AdvertisingSession>> StartAdvertisingAsync(
+      const GattServerSession& server, AdvertisingOptions advertisement, OperationOptions options = {},
+      std::function<void(PeripheralEndEvent)> on_end = {});
 
 private:
   explicit Bluetooth(std::shared_ptr<detail::Service> service);

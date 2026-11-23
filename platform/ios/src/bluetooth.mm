@@ -9,6 +9,7 @@
 
 namespace huxerui::bluetooth::detail {
 class IOSBackend;
+std::unique_ptr<PeripheralBackend> CreateIOSPeripheral(BackendEvents events, bool configured);
 }
 
 @interface HUXIOSBluetoothDelegate : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
@@ -122,6 +123,7 @@ GattCharacteristicProperties Properties(CBCharacteristic* characteristic) {
 class IOSBackend final : public Backend {
 public:
   explicit IOSBackend(BackendEvents events) : events_(std::move(events)), delegate_([HUXIOSBluetoothDelegate new]) {
+    peripheral_ = CreateIOSPeripheral(events_, configured_);
     delegate_.owner = this;
     if (CBManager.authorization == CBManagerAuthorizationAllowedAlways)
       OpenManager();
@@ -142,7 +144,23 @@ public:
     return configured_ ? StatusOf(central_) : AdapterStatus::Unavailable;
   }
 
+  BluetoothCapabilities PeripheralCapabilities() const override {
+    if (Status() == AdapterStatus::Unavailable)
+      return {};
+    return peripheral_->Capabilities();
+  }
+
+  void StopAdvertising(Token id) override {
+    peripheral_->StopAdvertising(id);
+  }
+
+  void CloseServer(Token id) override {
+    peripheral_->CloseServer(id);
+  }
+
   Cancellation Invoke(Request request, Completion reply) override {
+    if (IsPeripheralOperation(request.operation))
+      return peripheral_->Invoke(std::move(request), std::move(reply));
     if (CBManager.authorization != CBManagerAuthorizationAllowedAlways) {
       reply(Fail(Code::PermissionDenied, "Grant Bluetooth access before using Core Bluetooth"));
       return {};
@@ -573,6 +591,7 @@ private:
   }
 
   BackendEvents events_;
+  std::unique_ptr<PeripheralBackend> peripheral_;
   HUXIOSBluetoothDelegate* delegate_;
   CBCentralManager* central_ = nil;
   const bool configured_ = [NSBundle.mainBundle objectForInfoDictionaryKey:@"NSBluetoothAlwaysUsageDescription"] != nil;

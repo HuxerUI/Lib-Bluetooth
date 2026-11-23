@@ -1,6 +1,10 @@
 #include <huxerui/bluetooth.h>
 #include <huxerui/huxerui.h>
 
+#if defined(__ANDROID__)
+#include <huxerui/android/platform_registry.h>
+#endif
+
 #include <algorithm>
 #include <charconv>
 #include <memory>
@@ -22,6 +26,20 @@ struct DeviceRow {
 struct CharacteristicPath {
   std::string service;
   std::string characteristic;
+};
+
+constexpr char local_service_uuid[] = "e1120001-14f2-43f3-a98b-cfd9b47fd9bb";
+constexpr char local_value_uuid[] = "e1120002-14f2-43f3-a98b-cfd9b47fd9bb";
+
+struct LocalPeripheral {
+  State<bool> server_open{false};
+  State<bool> opening{false};
+  State<bool> advertising{false};
+  State<bool> starting_advertisement{false};
+  State<bool> subscribed{false};
+  State<int> value{0};
+  std::optional<GattServerSession> server;
+  std::optional<AdvertisingSession> advertisement;
 };
 
 struct Preview {
@@ -52,6 +70,7 @@ struct Preview {
   bool saving_selection = false;
   bool recovering = false;
   TaskHandle operation;
+  LocalPeripheral peripheral;
 
   void StopScan() {
     scan.reset();
@@ -161,6 +180,43 @@ Task<bool> Authorize(ApplicationHandle app, Permission permission, bool allow_pr
   (void)permission;
   (void)allow_prompt;
   co_return true;
+#endif
+}
+
+#if defined(__ANDROID__)
+constexpr char advertising_permission_module[] = "bluetooth/PreviewAdvertisingPermission";
+
+class AndroidAdvertisingPermission final {
+public:
+  explicit AndroidAdvertisingPermission(PlatformChannel channel) : channel_(std::move(channel)) {}
+
+  ~AndroidAdvertisingPermission() {
+    channel_.Close();
+  }
+
+  Task<bool> Request() const {
+    return AwaitCallback<bool>([channel = channel_](CallbackCompletion<bool> completion) {
+      const auto ticket = channel.Invoke("request", {}, [completion](PlatformResult<PlatformPayload> result) {
+        const auto* value = std::get_if<PlatformPayload>(&result);
+        completion.Complete(value && value->AsBoolean());
+      });
+      return [channel, ticket] { (void)channel.Cancel(ticket); };
+    });
+  }
+
+private:
+  PlatformChannel channel_;
+};
+#endif
+
+Task<bool> AuthorizeAdvertising(ApplicationHandle app) {
+#if defined(__ANDROID__)
+  (void)app;
+  const auto permission = OpenPlatformModule<std::shared_ptr<AndroidAdvertisingPermission>>(
+      advertising_permission_module);
+  co_return co_await permission->Request();
+#else
+  co_return co_await Authorize(app, Permission::BluetoothConnect);
 #endif
 }
 
@@ -449,7 +505,170 @@ View AttributeControls(const std::shared_ptr<Preview>& model, TaskScope tasks) {
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
+Task<void> OpenLocalServer(std::shared_ptr<Preview> model, std::shared_ptr<Bluetooth> bluetooth, ApplicationHandle app) {
+  auto& local = model->peripheral;
+  if (!co_await Authorize(app, Permission::BluetoothConnect)) {
+    local.opening = false;
+    model->status = "Bluetooth connect permission was denied";
+    co_return;
+  }
+  const auto weak = std::weak_ptr<Preview>(model);
+  using ReadResult = Result<Bytes, GattRequestError>;
+  using WriteResult = Result<void, GattRequestError>;
+  LocalGattCharacteristic characteristic{
+      .uuid = local_value_uuid,
+      .properties = {.can_read = true, .can_write_with_response = true, .can_notify = true},
+      .on_read = [weak] {
+        if (auto current = weak.lock()) {
+          const int value = current->peripheral.value;
+          return ReadResult::Success({static_cast<std::byte>(value)});
+        }
+        return ReadResult::Failure(GattRequestError::UnlikelyError);
+      },
+      .on_write = [weak](Bytes value) {
+        if (value.size() != 1)
+          return WriteResult::Failure(GattRequestError::InvalidValueLength);
+        if (auto current = weak.lock()) {
+          current->peripheral.value = std::to_integer<int>(value.front());
+          return WriteResult::Success();
+        }
+        return WriteResult::Failure(GattRequestError::UnlikelyError);
+      },
+      .on_subscription_changed = [weak](bool subscribed) {
+        if (auto current = weak.lock())
+          current->peripheral.subscribed = subscribed;
+      },
+  };
+  std::vector<LocalGattService> services{{local_service_uuid, {std::move(characteristic)}}};
+  auto opened = co_await bluetooth->OpenGattServerAsync(std::move(services), {}, [weak](PeripheralEndEvent event) {
+    if (auto current = weak.lock()) {
+      auto& local = current->peripheral;
+      local.server.reset();
+      local.server_open = false;
+      local.subscribed = false;
+      if (const auto* error = std::get_if<BluetoothError>(&event))
+        current->Report(*error);
+    }
+  });
+  local.opening = false;
+  if (opened.Succeeded()) {
+    local.server.emplace(std::move(opened).Value());
+    local.server_open = true;
+    model->status = "Local GATT server open";
+  } else {
+    model->Report(opened.Error());
+  }
+}
+
+Task<void> AdvertiseLocal(std::shared_ptr<Preview> model, std::shared_ptr<Bluetooth> bluetooth, ApplicationHandle app,
+                          bool associated) {
+  auto& local = model->peripheral;
+  if (!co_await AuthorizeAdvertising(app)) {
+    local.starting_advertisement = false;
+    model->status = "Bluetooth advertising permission was denied";
+    co_return;
+  }
+  if (associated && !local.server) {
+    local.starting_advertisement = false;
+    co_return;
+  }
+  auto on_end = [weak = std::weak_ptr<Preview>(model)](PeripheralEndEvent event) {
+    if (auto current = weak.lock()) {
+      current->peripheral.advertisement.reset();
+      current->peripheral.advertising = false;
+      if (const auto* error = std::get_if<BluetoothError>(&event))
+        current->Report(*error);
+    }
+  };
+  AdvertisingOptions options{.service_uuids = {local_service_uuid}};
+  auto pending = associated ? bluetooth->StartAdvertisingAsync(*local.server, std::move(options), {}, on_end)
+                            : bluetooth->StartAdvertisingAsync(std::move(options), {}, on_end);
+  auto started = co_await std::move(pending);
+  local.starting_advertisement = false;
+  if (started.Succeeded()) {
+    local.advertisement.emplace(std::move(started).Value());
+    local.advertising = true;
+    model->status = "Advertising";
+  } else {
+    model->Report(started.Error());
+  }
+}
+
+View PeripheralControls(const std::shared_ptr<Preview>& model, const std::shared_ptr<Bluetooth>& bluetooth,
+                        ApplicationHandle app, TaskScope tasks, BluetoothCapabilities capabilities) {
+  if (!capabilities.can_use_gatt_server && !capabilities.can_advertise)
+    return {};
+  auto& local = model->peripheral;
+  const bool open = local.server_open;
+  const bool advertising = local.advertising;
+  const bool starting = local.starting_advertisement;
+  const int value = local.value;
+  const auto start_advertising = [model, bluetooth, app, tasks](bool associated) {
+    auto& local = model->peripheral;
+    if (local.advertising || local.starting_advertisement)
+      return;
+    local.starting_advertisement = true;
+    tasks.Launch(AdvertiseLocal(model, bluetooth, app, associated));
+  };
+  return Column {
+    Text("Local BLE", TextRole::Title),
+    Text(local_service_uuid),
+    Flow {
+      capabilities.can_use_gatt_server ? View(Button(open ? "Close server" : "Open server")
+          .With(Enabled(!local.opening)).OnClick([model, bluetooth, app, tasks] {
+            auto& local = model->peripheral;
+            if (local.server) {
+              local.server->Stop();
+              local.server.reset();
+              local.server_open = false;
+              local.subscribed = false;
+              model->status = "Local GATT server closed";
+            } else if (!local.opening) {
+              local.opening = true;
+              tasks.Launch(OpenLocalServer(model, bluetooth, app));
+            }
+          })) : View{},
+      capabilities.can_advertise && open && !advertising ? View(Button("Advertise service")
+          .With(Enabled(!starting)).OnClick([start_advertising] { start_advertising(true); })) : View{},
+      capabilities.can_advertise_standalone && !advertising ? View(Button("Advertise only")
+          .With(Enabled(!starting)).OnClick([start_advertising] { start_advertising(false); })) : View{},
+      advertising ? View(Button("Stop advertising").OnClick([model] {
+        auto& local = model->peripheral;
+        if (local.advertisement)
+          local.advertisement->Stop();
+        local.advertisement.reset();
+        local.advertising = false;
+        model->status = "Advertising stopped";
+      })) : View{},
+      open ? View(Button("Notify").With(Enabled(local.subscribed)).OnClick([model, tasks] {
+        tasks.Launch([model]() -> Task<void> {
+          auto& local = model->peripheral;
+          if (!local.server)
+            co_return;
+          const int current = local.value;
+          const int next = (current + 1) % 256;
+          local.value = next;
+          Bytes bytes{static_cast<std::byte>(next)};
+          auto result = co_await local.server->NotifyAsync(local_service_uuid, local_value_uuid, std::move(bytes));
+          if (!result.Succeeded())
+            model->Report(result.Error());
+        });
+      })) : View{},
+    }.With(Spacing(8.0F)),
+    open ? View(Text("Local value " + std::to_string(value))) : View{},
+  }.With(Spacing(8.0F));
+}
+
 void InstallPreview(ApplicationContext& context) {
+#if defined(__ANDROID__)
+  android::JavaPlatformModuleFactory<std::shared_ptr<AndroidAdvertisingPermission>> factory;
+  factory.class_name = "org.huxerui.lib.bluetooth.preview.MainActivity$AdvertisePermissionFactory";
+  factory.create = [](PlatformChannel channel) {
+    return std::make_shared<AndroidAdvertisingPermission>(std::move(channel));
+  };
+  context.RegisterPlatformModule<std::shared_ptr<AndroidAdvertisingPermission>>(advertising_permission_module,
+                                                                               std::move(factory));
+#endif
   auto model = std::make_shared<Preview>();
   try {
     model->selection_file = UseApplication().Directories().data_directory.Child("bluetooth-device.txt");
@@ -650,6 +869,7 @@ View App() {
     }),
     Column(std::move(attributes)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     AttributeControls(model, tasks),
+    PeripheralControls(model, bluetooth, app, app_tasks, capabilities),
   }.With(Padding(16.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)));
 }
 

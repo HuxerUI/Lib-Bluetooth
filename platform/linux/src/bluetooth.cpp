@@ -8,6 +8,9 @@
 
 namespace huxerui::bluetooth::detail {
 
+std::unique_ptr<PeripheralBackend> CreateLinuxPeripheral(
+    BackendEvents events, std::function<std::shared_ptr<GDBusProxy>(const char*)> manager);
+
 namespace {
 
 using Code = BluetoothErrorCode;
@@ -619,6 +622,11 @@ struct State : std::enable_shared_from_this<State> {
 class LinuxBackend final : public Backend {
 public:
   explicit LinuxBackend(BackendEvents events) : state_(std::make_shared<State>(std::move(events))) {
+    peripheral_ = CreateLinuxPeripheral(state_->events, [weak = std::weak_ptr<State>(state_)](const char* name) {
+      if (auto state = weak.lock(); state && state->adapter)
+        return state->Proxy(g_dbus_proxy_get_object_path(state->adapter.get()), name);
+      return std::shared_ptr<GDBusProxy>{};
+    });
     state_->Initialize();
   }
 
@@ -626,7 +634,21 @@ public:
     return state_->status;
   }
 
+  BluetoothCapabilities PeripheralCapabilities() const override {
+    return peripheral_->Capabilities();
+  }
+
+  void StopAdvertising(Token id) override {
+    peripheral_->StopAdvertising(id);
+  }
+
+  void CloseServer(Token id) override {
+    peripheral_->CloseServer(id);
+  }
+
   Cancellation Invoke(Request request, Completion result) override {
+    if (IsPeripheralOperation(request.operation))
+      return peripheral_->Invoke(std::move(request), std::move(result));
     return state_->Invoke(std::move(request), std::move(result));
   }
 
@@ -640,6 +662,7 @@ public:
 
 private:
   std::shared_ptr<State> state_;
+  std::unique_ptr<PeripheralBackend> peripheral_;
 };
 
 } // namespace
