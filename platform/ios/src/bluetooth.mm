@@ -17,6 +17,16 @@ std::unique_ptr<PeripheralBackend> CreateIOSPeripheral(BackendEvents events, boo
 @end
 
 namespace huxerui::bluetooth::detail {
+namespace {
+class StreamChannel;
+}
+}
+
+@interface HUXIOSChannelStreamDelegate : NSObject <NSStreamDelegate>
+@property(nonatomic, assign) huxerui::bluetooth::detail::StreamChannel* owner;
+@end
+
+namespace huxerui::bluetooth::detail {
 
 namespace {
 
@@ -101,9 +111,11 @@ struct Peer {
   std::map<Token, CBDescriptor*> descriptors;
   std::set<CBCharacteristic*> stopping_notifications;
   std::set<CBCharacteristic*> unavailable_descriptors;
+  std::set<CBCharacteristic*> retirement_notifications;
   std::optional<BluetoothError> discovery_error;
   std::size_t pending = 0;
   bool discovering = false;
+  bool retired = false;
 };
 
 GattCharacteristicProperties Properties(CBCharacteristic* characteristic) {
@@ -117,6 +129,146 @@ GattCharacteristicProperties Properties(CBCharacteristic* characteristic) {
           (properties & (CBCharacteristicPropertyIndicate | CBCharacteristicPropertyIndicateEncryptionRequired)) != 0,
   };
 }
+
+class StreamChannel final : public std::enable_shared_from_this<StreamChannel> {
+public:
+  StreamChannel(CBL2CAPChannel* channel, Token id, BackendEvents events)
+      : channel_(channel), delegate_([HUXIOSChannelStreamDelegate new]), id_(id), events_(std::move(events)) {}
+
+  ~StreamChannel() {
+    delegate_.owner = nullptr;
+    for (NSStream* stream in @[channel_.inputStream, channel_.outputStream]) {
+      stream.delegate = nil;
+      [stream removeFromRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+      [stream close];
+    }
+  }
+
+  void Start() {
+    delegate_.owner = this;
+    for (NSStream* stream in @[channel_.inputStream, channel_.outputStream]) {
+      stream.delegate = delegate_;
+      [stream scheduleInRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+      [stream open];
+    }
+  }
+
+  void Read(Completion reply) {
+    reader_ = std::move(reply);
+    ReadAvailable();
+  }
+
+  void Write(Bytes value, Completion reply) {
+    writer_ = std::move(reply);
+    value_ = std::move(value);
+    offset_ = 0;
+    WriteAvailable();
+  }
+
+  void Event(NSStream* stream, NSStreamEvent event) {
+    auto owner = shared_from_this();
+    switch (event) {
+      case NSStreamEventHasBytesAvailable:
+        ReadAvailable();
+        break;
+      case NSStreamEventHasSpaceAvailable:
+        WriteAvailable();
+        break;
+      case NSStreamEventEndEncountered:
+        // The two stream delegates can report EOF independently.
+        ReportEnd(stream == channel_.inputStream);
+        break;
+      case NSStreamEventErrorOccurred:
+        events_(ChannelLost{id_, PlatformError(stream.streamError, Code::Disconnected,
+                                               "The L2CAP stream closed unexpectedly")});
+        break;
+      default:
+        break;
+    }
+  }
+
+private:
+  void ReportEnd(bool input) {
+    auto& ended = input ? input_ended_ : output_ended_;
+    if (!std::exchange(ended, true))
+      events_(ChannelStreamEnded{.channel = id_, .input = input});
+  }
+
+  void ReadAvailable() {
+    if (!reader_ || input_ended_)
+      return;
+    auto* input = channel_.inputStream;
+    if (input.hasBytesAvailable) {
+      Bytes value(16384);
+      const auto count = [input read:reinterpret_cast<std::uint8_t*>(value.data()) maxLength:value.size()];
+      if (count < 0) {
+        std::exchange(reader_, {})(Reply::Failure(PlatformError(input.streamError, Code::Disconnected, {})));
+        return;
+      }
+      if (count == 0) {
+        ReportEnd(true);
+        return;
+      }
+      value.resize(static_cast<std::size_t>(count));
+      std::exchange(reader_, {})(Ok(std::move(value)));
+    } else if (input.streamStatus == NSStreamStatusAtEnd) {
+      ReportEnd(true);
+    }
+  }
+
+  void WriteAvailable() {
+    if (!writer_ || output_ended_)
+      return;
+    auto* output = channel_.outputStream;
+    if (output.streamStatus == NSStreamStatusAtEnd) {
+      ReportEnd(false);
+      return;
+    }
+    if (output.streamStatus == NSStreamStatusClosed) {
+      std::exchange(writer_, {})(Fail(Code::Disconnected, "The L2CAP output stream is closed"));
+      return;
+    }
+    while (offset_ < value_.size() && output.hasSpaceAvailable) {
+      const auto count = [output write:reinterpret_cast<const std::uint8_t*>(value_.data() + offset_)
+                             maxLength:value_.size() - offset_];
+      if (count < 0) {
+        std::exchange(writer_, {})(Reply::Failure(PlatformError(output.streamError, Code::Disconnected, {})));
+        return;
+      }
+      if (count == 0)
+        return;
+      offset_ += static_cast<std::size_t>(count);
+    }
+    if (offset_ == value_.size()) {
+      value_ = {};
+      std::exchange(writer_, {})(Ok());
+    }
+  }
+
+  CBL2CAPChannel* channel_;
+  HUXIOSChannelStreamDelegate* delegate_;
+  Token id_;
+  BackendEvents events_;
+  Completion reader_;
+  Completion writer_;
+  Bytes value_;
+  std::size_t offset_ = 0;
+  bool input_ended_ = false;
+  bool output_ended_ = false;
+};
+
+struct L2capOpen {
+  Token id;
+  CBL2CAPPSM psm;
+  CBPeripheral* peripheral;
+  Completion reply;
+  bool dispatched = false;
+};
+
+struct L2capChannel {
+  CBPeripheral* peripheral;
+  std::shared_ptr<StreamChannel> streams;
+};
 
 } // namespace
 
@@ -134,9 +286,12 @@ public:
     central_.delegate = nil;
     if (scan_)
       [central_ stopScan];
-    for (auto& [token, peer] : peers_) {
-      peer.peripheral.delegate = nil;
-      [central_ cancelPeripheralConnection:peer.peripheral];
+    channels_.clear();
+    for (auto& [id, peripheral] : devices_) {
+      if (peripheral.delegate == delegate_)
+        peripheral.delegate = nil;
+      if (peripheral.state != CBPeripheralStateDisconnected)
+        [central_ cancelPeripheralConnection:peripheral];
     }
   }
 
@@ -159,6 +314,16 @@ public:
   }
 
   Cancellation Invoke(Request request, Completion reply) override {
+    if (request.operation == Operation::ChannelRead || request.operation == Operation::ChannelWrite) {
+      auto found = channels_.find(request.link);
+      if (found == channels_.end())
+        reply(Fail(Code::Disconnected, "The L2CAP channel is closed"));
+      else if (request.operation == Operation::ChannelRead)
+        found->second.streams->Read(std::move(reply));
+      else
+        found->second.streams->Write(std::move(request.value), std::move(reply));
+      return {};
+    }
     if (IsPeripheralOperation(request.operation))
       return peripheral_->Invoke(std::move(request), std::move(reply));
     if (CBManager.authorization != CBManagerAuthorizationAllowedAlways) {
@@ -185,21 +350,87 @@ public:
 
   void Disconnect(Token link) override {
     std::erase_if(pending_, [link](const auto& entry) { return entry.second.first.link == link; });
-    auto entry = peers_.extract(link);
-    if (entry.empty())
+    auto found = peers_.find(link);
+    if (found == peers_.end())
       return;
-    auto* peripheral = entry.mapped().peripheral;
-    peripheral.delegate = nil;
-    if (peripheral.state != CBPeripheralStateDisconnected) {
-      retiring_.insert(DeviceId(peripheral));
-      [central_ cancelPeripheralConnection:peripheral];
+    auto* peripheral = found->second.peripheral;
+    auto& peer = found->second;
+    if (UsesL2cap(peripheral)) {
+      peer.retired = true;
+      for (auto& [id, characteristic] : peer.characteristics) {
+        if (characteristic.isNotifying ||
+            (peer.result && peer.request.operation == Operation::Notify && peer.request.attribute == id)) {
+          peer.retirement_notifications.insert(characteristic);
+          [peripheral setNotifyValue:NO forCharacteristic:characteristic];
+        }
+      }
+      if ((peer.result && peer.request.operation != Operation::Connect) || !peer.retirement_notifications.empty())
+        return;
     }
+    peers_.erase(found);
+    MaybeDisconnect(peripheral);
+  }
+
+  void CloseChannel(Token id) override {
+    std::erase_if(pending_, [id](const auto& entry) { return entry.second.first.link == id; });
+    if (auto channel = channels_.extract(id); !channel.empty()) {
+      auto* peripheral = channel.mapped().peripheral;
+      channel.mapped().streams.reset();
+      MaybeDisconnect(peripheral);
+      return;
+    }
+    for (auto open = opening_.begin(); open != opening_.end(); ++open) {
+      if (open->second.id == id) {
+        auto* peripheral = open->second.peripheral;
+        // A dispatched open keeps its slot until the delegate callback or link teardown.
+        if (open->second.dispatched)
+          open->second.reply = {};
+        else
+          opening_.erase(open);
+        MaybeDisconnect(peripheral);
+        return;
+      }
+    }
+  }
+
+  void L2capOpened(CBPeripheral* peripheral, CBL2CAPChannel* channel, NSError* error) {
+    const auto id = DeviceId(peripheral);
+    auto open = opening_.find(id);
+    if (open == opening_.end() || !open->second.dispatched ||
+        (channel && channel.PSM != open->second.psm)) {
+      [channel.inputStream close];
+      [channel.outputStream close];
+      return;
+    }
+    auto attempt = opening_.extract(open);
+    const auto token = attempt.mapped().id;
+    auto reply = std::move(attempt.mapped().reply);
+    if (!reply || error || !channel) {
+      [channel.inputStream close];
+      [channel.outputStream close];
+      if (reply)
+        reply(Reply::Failure(PlatformError(error, Code::DeviceUnavailable, "The LE L2CAP endpoint is unavailable")));
+      MaybeDisconnect(peripheral);
+      return;
+    }
+    auto streams = std::make_shared<StreamChannel>(channel, token, events_);
+    channels_.emplace(token, L2capChannel{peripheral, streams});
+    streams->Start();
+    reply(Ok());
   }
 
   void ManagerChanged() {
     events_(Status());
-    if (Status() == AdapterStatus::PoweredOff || Status() == AdapterStatus::Unavailable)
+    if (Status() == AdapterStatus::PoweredOff || Status() == AdapterStatus::Unavailable) {
       retiring_.clear();
+      std::erase_if(peers_, [](const auto& entry) { return entry.second.retired; });
+      auto opening = std::exchange(opening_, {});
+      for (auto& [id, attempt] : opening) {
+        if (attempt.reply)
+          attempt.reply(Fail(Status() == AdapterStatus::PoweredOff ? Code::AdapterOff : Code::Unavailable,
+                             "The Core Bluetooth adapter is unavailable"));
+      }
+    }
     if (central_.state == CBManagerStateUnknown || central_.state == CBManagerStateResetting)
       return;
     auto pending = std::exchange(pending_, {});
@@ -240,8 +471,13 @@ public:
   void Connected(CBPeripheral* peripheral) {
     if (retiring_.contains(DeviceId(peripheral)))
       return;
+    peripheral.delegate = delegate_;
+    auto open = opening_.find(DeviceId(peripheral));
+    if (open != opening_.end() && open->second.reply && !open->second.dispatched) {
+      open->second.dispatched = true;
+      [peripheral openL2CAPChannel:open->second.psm];
+    }
     if (auto* peer = Find(peripheral); peer && peer->request.operation == Operation::Connect) {
-      peripheral.delegate = delegate_;
       Complete(*peer, Ok(WriteLimits{
           [peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithResponse],
           [peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse]}));
@@ -249,13 +485,24 @@ public:
   }
 
   void Disconnected(CBPeripheral* peripheral, NSError* error) {
-    if (retiring_.erase(DeviceId(peripheral))) {
+    const auto id = DeviceId(peripheral);
+    auto failure = PlatformError(error, Code::Disconnected, "The Bluetooth device disconnected");
+    if (auto open = opening_.extract(id); !open.empty() && open.mapped().reply)
+      open.mapped().reply(Reply::Failure(failure));
+    for (const auto& [token, channel] : channels_) {
+      if (channel.peripheral == peripheral)
+        events_(ChannelLost{token, failure});
+    }
+    if (retiring_.erase(id)) {
       if (auto* peer = Find(peripheral))
         [central_ connectPeripheral:peer->peripheral options:nil];
       return;
     }
     if (auto* peer = Find(peripheral)) {
-      auto failure = PlatformError(error, Code::Disconnected, "The Bluetooth device disconnected");
+      if (peer->retired) {
+        peers_.erase(peer->link);
+        return;
+      }
       if (peer->result && peer->request.operation == Operation::Connect)
         Complete(*peer, Reply::Failure(failure));
       events_(LinkLost{peer->link, std::move(failure)});
@@ -367,6 +614,8 @@ public:
 
   void NotifyState(CBPeripheral* peripheral, CBCharacteristic* characteristic, NSError* error) {
     if (auto* peer = Find(peripheral)) {
+      if (peer->retired && (error || !characteristic.isNotifying))
+        peer->retirement_notifications.erase(characteristic);
       if (peer->discovering && peer->stopping_notifications.erase(characteristic)) {
         if (error)
           peer->discovery_error = PlatformError(error, Code::PlatformFailure, {});
@@ -406,6 +655,40 @@ private:
     return nullptr;
   }
 
+  bool UsesL2cap(CBPeripheral* peripheral) const {
+    const auto open = opening_.find(DeviceId(peripheral));
+    if (open != opening_.end() && open->second.reply)
+      return true;
+    return std::ranges::any_of(channels_, [peripheral](const auto& entry) {
+      return entry.second.peripheral == peripheral;
+    });
+  }
+
+  void MaybeDisconnect(CBPeripheral* peripheral) {
+    auto* peer = Find(peripheral);
+    if ((peer && !peer->retired) || UsesL2cap(peripheral))
+      return;
+    if (peer)
+      peers_.erase(peer->link);
+    peripheral.delegate = nil;
+    if (central_.state == CBManagerStatePoweredOn && peripheral.state != CBPeripheralStateDisconnected &&
+        retiring_.insert(DeviceId(peripheral)).second)
+      [central_ cancelPeripheralConnection:peripheral];
+  }
+
+  void OpenL2cap(const Request& request, CBPeripheral* peripheral, Completion reply) {
+    const auto id = DeviceId(peripheral);
+    if (opening_.contains(id) || retiring_.contains(id)) {
+      reply(Fail(Code::Busy, "A Core Bluetooth channel or link is still opening or closing"));
+      return;
+    }
+    opening_.emplace(id, L2capOpen{request.link, request.psm, peripheral, std::move(reply)});
+    if (peripheral.state == CBPeripheralStateConnected)
+      Connected(peripheral);
+    else if (peripheral.state != CBPeripheralStateConnecting)
+      [central_ connectPeripheral:peripheral options:nil];
+  }
+
   void InvokeReady(Request request, Completion reply) {
     if (central_.state != CBManagerStatePoweredOn && request.operation != Operation::Restore) {
       reply(Fail(central_.state == CBManagerStatePoweredOff ? Code::AdapterOff : Code::Unavailable,
@@ -422,7 +705,8 @@ private:
       reply(Ok());
       return;
     }
-    if (request.operation == Operation::Restore || request.operation == Operation::Connect) {
+    if (request.operation == Operation::Restore || request.operation == Operation::Connect ||
+        request.operation == Operation::OpenL2cap) {
       auto found = devices_.find(request.device);
       if (found == devices_.end()) {
         auto* uuid = [[NSUUID alloc] initWithUUIDString:Text(request.device)];
@@ -436,15 +720,24 @@ private:
       }
       if (request.operation == Operation::Restore) {
         reply(Ok(Describe(found->second)));
+      } else if (request.operation == Operation::OpenL2cap) {
+        OpenL2cap(request, found->second, std::move(reply));
       } else {
         auto* peripheral = found->second;
+        if (auto* retired = Find(peripheral); retired && retired->retired) {
+          if (retired->result || !retired->retirement_notifications.empty()) {
+            reply(Fail(Code::Busy, "The previous GATT request is still retiring"));
+            return;
+          }
+          peers_.erase(retired->link);
+        }
         auto& peer = peers_.emplace(request.link, Peer{.link = request.link, .peripheral = peripheral,
                                                        .request = std::move(request), .result = std::move(reply)})
                          .first->second;
         if (!retiring_.contains(DeviceId(peripheral))) {
           if (peripheral.state == CBPeripheralStateConnected)
             Connected(peripheral);
-          else
+          else if (peripheral.state != CBPeripheralStateConnecting)
             [central_ connectPeripheral:peer.peripheral options:nil];
         }
       }
@@ -601,10 +894,13 @@ private:
   std::map<std::string, CBPeripheral*> devices_;
   std::map<Token, Peer> peers_;
   std::set<std::string> retiring_;
+  std::map<std::string, L2capOpen> opening_;
+  std::map<Token, L2capChannel> channels_;
 };
 
 BluetoothCapabilities PlatformCapabilities() {
-  return {.can_scan = true, .can_restore_device = true, .can_use_gatt_client = true, .can_access_descriptors = true};
+  return {.can_scan = true, .can_restore_device = true, .can_use_gatt_client = true, .can_access_descriptors = true,
+          .can_connect_le_l2cap = true};
 }
 
 void RegisterPlatform(ApplicationContext&) {}
@@ -647,6 +943,13 @@ std::unique_ptr<Backend> CreateBackend(TaskScope, BackendEvents events) {
                        error:(NSError*)error {
   if (_owner)
     _owner->Disconnected(peripheral, error);
+}
+
+- (void)peripheral:(CBPeripheral*)peripheral
+    didOpenL2CAPChannel:(CBL2CAPChannel*)channel
+                  error:(NSError*)error {
+  if (_owner)
+    _owner->L2capOpened(peripheral, channel, error);
 }
 
 - (void)peripheral:(CBPeripheral*)peripheral didDiscoverServices:(NSError*)error {
@@ -705,6 +1008,15 @@ std::unique_ptr<Backend> CreateBackend(TaskScope, BackendEvents events) {
 - (void)peripheralIsReadyToSendWriteWithoutResponse:(CBPeripheral*)peripheral {
   if (_owner)
     _owner->WriteReady(peripheral);
+}
+
+@end
+
+@implementation HUXIOSChannelStreamDelegate
+
+- (void)stream:(NSStream*)stream handleEvent:(NSStreamEvent)event {
+  if (_owner)
+    _owner->Event(stream, event);
 }
 
 @end

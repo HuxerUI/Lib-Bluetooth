@@ -1,6 +1,18 @@
 #include "backend.h"
 
 #include <gio/gio.h>
+#include <gio/gunixfdlist.h>
+#include <glib-unix.h>
+
+#include <sys/socket.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/l2cap.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 
 #include <algorithm>
 #include <set>
@@ -132,6 +144,76 @@ struct Link {
   std::set<Token> notifications;
 };
 
+constexpr char profile_manager_interface[] = "org.bluez.ProfileManager1";
+constexpr char profile_interface[] = "org.bluez.Profile1";
+constexpr char profile_xml[] = R"(
+<node><interface name="org.bluez.Profile1">
+  <method name="Release"/>
+  <method name="NewConnection">
+    <arg type="o" direction="in"/>
+    <arg type="h" direction="in"/>
+    <arg type="a{sv}" direction="in"/>
+  </method>
+  <method name="RequestDisconnection"><arg type="o" direction="in"/></method>
+</interface></node>)";
+
+BluetoothError SocketError(int error, Code fallback) {
+  const auto code = error == EACCES || error == EPERM ? Code::PermissionDenied
+                  : error == ETIMEDOUT ? Code::TimedOut
+                  : error == EAFNOSUPPORT || error == EPROTONOSUPPORT ? Code::Unsupported
+                  : fallback;
+  return Error(code, std::strerror(error), "errno", error);
+}
+
+bool ParseAddress(const std::string& value, bdaddr_t& address) {
+  unsigned char bytes[6];
+  int consumed = 0;
+  if (std::sscanf(value.c_str(), "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx%n",
+                  &bytes[5], &bytes[4], &bytes[3], &bytes[2], &bytes[1], &bytes[0], &consumed) != 6 ||
+      static_cast<std::size_t>(consumed) != value.size()) {
+    return false;
+  }
+  std::memcpy(address.b, bytes, sizeof(bytes));
+  return true;
+}
+
+struct SocketChannel {
+  explicit SocketChannel(std::string device, Completion reply)
+      : device(std::move(device)), opening(std::move(reply)) {}
+
+  ~SocketChannel() {
+    if (read_source)
+      g_source_remove(read_source);
+    if (write_source)
+      g_source_remove(write_source);
+    if (fd >= 0)
+      close(fd);
+    if (object)
+      g_dbus_connection_unregister_object(bus.get(), object);
+  }
+
+  std::string device;
+  std::string uuid;
+  std::shared_ptr<GDBusProxy> profile_manager;
+  std::shared_ptr<GDBusConnection> bus;
+  std::string object_path;
+  guint object = 0;
+  int fd = -1;
+  guint read_source = 0;
+  guint write_source = 0;
+  std::uint16_t transmit_limit = 0;
+  bool packet = false;
+  bool registered = false;
+  bool connecting = true;
+  bool profile_connected = false;
+  bool retiring = false;
+  Completion opening;
+  Completion reading;
+  Completion writing;
+  Bytes output;
+  std::size_t written = 0;
+};
+
 struct State : std::enable_shared_from_this<State> {
   explicit State(BackendEvents receive) : events(std::move(receive)) {}
 
@@ -141,8 +223,20 @@ struct State : std::enable_shared_from_this<State> {
       if (scan_proxy)
         Call(scan_proxy.get(), "StopDiscovery", nullptr, [](Variant, auto) {});
     }
-    for (const auto& [id, link] : links)
-      Cleanup(link);
+    while (!channels.empty()) {
+      auto channel = channels.extract(channels.begin());
+      if (channel.mapped()->registered) {
+        Call(channel.mapped()->profile_manager.get(), "UnregisterProfile",
+             g_variant_new("(o)", channel.mapped()->object_path.c_str()), [](Variant, auto) {});
+      }
+    }
+    for (const auto& [id, link] : links) {
+      CleanupNotifications(link);
+      if (link.owns_connection)
+        Call(link.device.get(), "Disconnect", nullptr, [](Variant, auto) {});
+    }
+    for (const auto& [path, device] : held_connections)
+      Call(device.get(), "Disconnect", nullptr, [](Variant, auto) {});
   }
 
   void Initialize() {
@@ -282,6 +376,7 @@ struct State : std::enable_shared_from_this<State> {
     const std::string path = g_dbus_object_get_object_path(object);
     if (adapter && path == g_dbus_proxy_get_object_path(adapter.get()))
       RefreshAdapter();
+    LoseChannels(path, "BlueZ removed the connected device");
     for (auto& [id, link] : links) {
       if (link.path == path) {
         events(LinkLost{id, Error(Code::Disconnected, "BlueZ removed the connected device")});
@@ -298,6 +393,9 @@ struct State : std::enable_shared_from_this<State> {
     if (type == adapter_interface) {
       RefreshAdapter();
     } else if (type == device_interface) {
+      const auto connected = OwnVariant(g_variant_lookup_value(changed, "Connected", G_VARIANT_TYPE_BOOLEAN));
+      if (connected && !g_variant_get_boolean(connected.get()))
+        LoseChannels(path, "BlueZ reported a Bluetooth disconnect");
       if (OwnVariant(g_variant_lookup_value(changed, "RSSI", nullptr)) ||
           OwnVariant(g_variant_lookup_value(changed, "ManufacturerData", nullptr)) ||
           OwnVariant(g_variant_lookup_value(changed, "ServiceData", nullptr)) ||
@@ -331,20 +429,47 @@ struct State : std::enable_shared_from_this<State> {
     }
   }
 
+  void LoseChannels(const std::string& path, const char* message) {
+    for (const auto& [id, channel] : channels)
+      if (channel->device == path && !channel->connecting)
+        events(ChannelLost{id, Error(Code::Disconnected, message)});
+  }
+
+  Cancellation Defer(Request request, Completion reply) {
+    const auto id = next++;
+    queued.emplace(id, std::pair{std::move(request), std::move(reply)});
+    return [weak = weak_from_this(), id] {
+      if (auto state = weak.lock())
+        state->queued.erase(id);
+    };
+  }
+
   Cancellation Invoke(Request request, Completion reply) {
-    if (initializing) {
-      const auto id = next++;
-      queued.emplace(id, std::pair{std::move(request), std::move(reply)});
-      return [weak = weak_from_this(), id] {
-        if (auto state = weak.lock())
-          state->queued.erase(id);
-      };
-    }
+    if (initializing || (request.operation == Operation::Connect && retiring_devices.contains(request.device)))
+      return Defer(std::move(request), std::move(reply));
     if (!adapter) {
       reply(Fail(Code::Unavailable, "The BlueZ adapter or system service is unavailable"));
       return {};
     }
     switch (request.operation) {
+      case Operation::ListRfcomm: {
+        std::vector<FoundDevice> candidates;
+        for (auto device : Objects(device_interface)) {
+          if (OnAdapter(device.get()) && Flag(device.get(), "Paired") &&
+              String(device.get(), "AddressType") != "random")
+            candidates.push_back(Describe(device.get()));
+        }
+        reply(Ok(std::move(candidates)));
+        return {};
+      }
+      case Operation::OpenRfcomm:
+      case Operation::OpenL2cap:
+        OpenChannel(std::move(request), std::move(reply));
+        return {};
+      case Operation::ChannelRead:
+      case Operation::ChannelWrite:
+        SocketIo(std::move(request), std::move(reply));
+        return {};
       case Operation::Scan:
         StartScan(std::move(request), std::move(reply));
         return {};
@@ -362,6 +487,347 @@ struct State : std::enable_shared_from_this<State> {
         reply(Fail(Code::Unsupported, "BlueZ does not support this Bluetooth operation"));
         return {};
     }
+  }
+
+  void OpenChannel(Request request, Completion reply) {
+    auto device = Proxy(request.device, device_interface);
+    if (!device || !OnAdapter(device.get())) {
+      reply(Fail(Code::DeviceUnavailable, "BlueZ no longer recognizes this Bluetooth peer"));
+      return;
+    }
+    if (retiring_devices.contains(request.device)) {
+      reply(Fail(Code::Busy, "The BlueZ link is still closing"));
+      return;
+    }
+    for (const auto& [id, channel] : channels) {
+      if (channel->device == request.device && channel->connecting) {
+        reply(Fail(Code::Busy, "A Bluetooth channel is already opening for the peer"));
+        return;
+      }
+    }
+    const auto id = request.link;
+    auto channel = std::make_unique<SocketChannel>(request.device, std::move(reply));
+    channel->packet = request.operation == Operation::OpenL2cap;
+    auto& opened = *channels.emplace(id, std::move(channel)).first->second;
+    if (opened.packet)
+      ConnectL2cap(id, opened, device.get(), request.psm);
+    else
+      RegisterRfcomm(id, opened, std::move(device), std::move(request.service_uuid));
+  }
+
+  void FinishOpen(Token id, Reply result) {
+    auto& channel = *channels.at(id);
+    channel.connecting = false;
+    if (auto reply = std::exchange(channel.opening, {}))
+      reply(std::move(result));
+  }
+
+  void CompleteL2cap(Token id, SocketChannel& channel) {
+    int error = 0;
+    socklen_t size = sizeof(error);
+    if (getsockopt(channel.fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0)
+      error = errno;
+    size = sizeof(channel.transmit_limit);
+    if (!error && getsockopt(channel.fd, SOL_BLUETOOTH, BT_SNDMTU, &channel.transmit_limit, &size) < 0)
+      error = errno;
+    if (error || !channel.transmit_limit) {
+      FinishOpen(id, Reply::Failure(SocketError(error ? error : EPROTO, Code::DeviceUnavailable)));
+      return;
+    }
+    FinishOpen(id, Ok());
+  }
+
+  void ConnectL2cap(Token id, SocketChannel& channel, GDBusProxy* device, std::uint16_t psm) {
+    sockaddr_l2 source{};
+    source.l2_family = AF_BLUETOOTH;
+    source.l2_bdaddr_type = String(adapter.get(), "AddressType") == "random" ? BDADDR_LE_RANDOM : BDADDR_LE_PUBLIC;
+    sockaddr_l2 destination{};
+    destination.l2_family = AF_BLUETOOTH;
+    destination.l2_psm = htobs(psm);
+    const auto address_type = String(device, "AddressType");
+    destination.l2_bdaddr_type = address_type == "random" ? BDADDR_LE_RANDOM : BDADDR_LE_PUBLIC;
+    if ((address_type != "random" && address_type != "public") ||
+        !ParseAddress(String(adapter.get(), "Address"), source.l2_bdaddr) ||
+        !ParseAddress(String(device, "Address"), destination.l2_bdaddr)) {
+      FinishOpen(id, Fail(Code::DeviceUnavailable, "The BlueZ LE address or address type is unavailable"));
+      return;
+    }
+    channel.fd = socket(AF_BLUETOOTH, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, BTPROTO_L2CAP);
+    bt_security security{BT_SECURITY_MEDIUM, 0};
+    if (channel.fd < 0 ||
+        setsockopt(channel.fd, SOL_BLUETOOTH, BT_SECURITY, &security, sizeof(security)) < 0 ||
+        bind(channel.fd, reinterpret_cast<sockaddr*>(&source), sizeof(source)) < 0) {
+      FinishOpen(id, Reply::Failure(SocketError(errno, Code::PlatformFailure)));
+      return;
+    }
+    if (connect(channel.fd, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) == 0) {
+      CompleteL2cap(id, channel);
+    } else if (errno == EINPROGRESS || errno == EAGAIN) {
+      WatchSocket(id, channel, false);
+    } else {
+      FinishOpen(id, Reply::Failure(SocketError(errno, Code::DeviceUnavailable)));
+    }
+  }
+
+  void RegisterRfcomm(Token id, SocketChannel& channel, std::shared_ptr<GDBusProxy> device, std::string uuid) {
+    auto manager = Proxy("/org/bluez", profile_manager_interface);
+    if (!manager) {
+      FinishOpen(id, Fail(Code::Unsupported, "BlueZ ProfileManager1 is unavailable"));
+      return;
+    }
+    channel.profile_manager = manager;
+    channel.uuid = std::move(uuid);
+    channel.bus = OwnObject(G_DBUS_CONNECTION(g_object_ref(g_dbus_proxy_get_connection(manager.get()))));
+    channel.object_path = "/org/huxerui/bluetooth/profile_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) +
+                          "_" + std::to_string(id);
+    const auto info = std::unique_ptr<GDBusNodeInfo, decltype(&g_dbus_node_info_unref)>(
+        g_dbus_node_info_new_for_xml(profile_xml, nullptr), g_dbus_node_info_unref);
+    struct ProfileTarget {
+      std::weak_ptr<State> state;
+      Token id;
+    };
+    static const GDBusInterfaceVTable methods{
+        .method_call = [](GDBusConnection*, const gchar* sender, const gchar*, const gchar*, const gchar* method,
+                          GVariant* arguments, GDBusMethodInvocation* invocation, gpointer data) {
+          auto& target = *static_cast<ProfileTarget*>(data);
+          if (auto state = target.state.lock())
+            state->ProfileMethod(target.id, sender, method, arguments, invocation);
+          else
+            g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Profile closed");
+        }};
+    auto target = std::make_unique<ProfileTarget>(ProfileTarget{weak_from_this(), id});
+    channel.object = g_dbus_connection_register_object(channel.bus.get(), channel.object_path.c_str(),
+                                                       info->interfaces[0], &methods, target.get(),
+                                                       [](gpointer data) { delete static_cast<ProfileTarget*>(data); },
+                                                       nullptr);
+    if (!channel.object) {
+      FinishOpen(id, Fail(Code::PlatformFailure, "The RFCOMM profile could not be exported"));
+      return;
+    }
+    target.release();
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&options, "{sv}", "Role", g_variant_new_string("client"));
+    g_variant_builder_add(&options, "{sv}", "AutoConnect", g_variant_new_boolean(FALSE));
+    g_variant_builder_add(&options, "{sv}", "RequireAuthentication", g_variant_new_boolean(TRUE));
+    Call(manager.get(), "RegisterProfile",
+         g_variant_new("(osa{sv})", channel.object_path.c_str(), channel.uuid.c_str(), &options),
+         [weak = weak_from_this(), id, manager, path = channel.object_path,
+          device = std::move(device)](Variant, auto error) {
+      if (auto state = weak.lock()) {
+        state->ProfileRegistered(id, device.get(), std::move(error));
+      } else if (!error) {
+        Call(manager.get(), "UnregisterProfile", g_variant_new("(o)", path.c_str()), [](Variant, auto) {});
+      }
+    });
+  }
+
+  void ProfileRegistered(Token id, GDBusProxy* device, std::optional<BluetoothError> error) {
+    const auto found = channels.find(id);
+    if (found == channels.end())
+      return;
+    auto& channel = *found->second;
+    if (error) {
+      if (error->platform_domain.ends_with(".AlreadyExists"))
+        error->code = Code::Busy;
+      FinishOpen(id, Reply::Failure(std::move(*error)));
+      if (channel.retiring)
+        RemoveChannel(id);
+      return;
+    }
+    channel.registered = true;
+    if (channel.retiring) {
+      RemoveChannel(id);
+      return;
+    }
+    Call(device, "ConnectProfile", g_variant_new("(s)", channel.uuid.c_str()),
+         [weak = weak_from_this(), id](Variant, auto error) {
+      if (auto state = weak.lock(); state && state->channels.contains(id)) {
+        auto& channel = *state->channels.at(id);
+        if (error) {
+          if (error->platform_domain.ends_with(".NotAvailable"))
+            error->code = Code::DeviceUnavailable;
+          state->FinishOpen(id, Reply::Failure(std::move(*error)));
+        } else {
+          channel.profile_connected = true;
+          if (channel.fd >= 0)
+            state->FinishOpen(id, Ok());
+        }
+      }
+    });
+  }
+
+  void ProfileMethod(Token id, const char* sender, std::string_view method, GVariant* arguments,
+                     GDBusMethodInvocation* invocation) {
+    const auto found = channels.find(id);
+    if (found == channels.end()) {
+      g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Profile closed");
+      return;
+    }
+    auto& channel = *found->second;
+    const std::unique_ptr<char, decltype(&g_free)> owner(
+        g_dbus_proxy_get_name_owner(channel.profile_manager.get()), g_free);
+    const char* device = nullptr;
+    if (method != "Release")
+      g_variant_get_child(arguments, 0, "&o", &device);
+    if (!owner || std::string_view(owner.get()) != sender || (device && channel.device != device)) {
+      g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Unexpected profile request");
+      return;
+    }
+    if (method == "NewConnection") {
+      gint32 handle = -1;
+      g_variant_get_child(arguments, 1, "h", &handle);
+      auto* message = g_dbus_method_invocation_get_message(invocation);
+      auto* list = g_dbus_message_get_unix_fd_list(message);
+      if (!channel.retiring && channel.connecting && channel.fd < 0 && list)
+        channel.fd = g_unix_fd_list_get(list, handle, nullptr);
+      else {
+        g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Unexpected RFCOMM socket");
+        return;
+      }
+      if (channel.fd < 0 || fcntl(channel.fd, F_SETFL, O_NONBLOCK) < 0) {
+        g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Rejected", "Invalid RFCOMM socket");
+        FinishOpen(id, Fail(Code::PlatformFailure, "The BlueZ RFCOMM socket is unavailable"));
+        return;
+      }
+      g_dbus_method_invocation_return_value(invocation, nullptr);
+      if (channel.profile_connected)
+        FinishOpen(id, Ok());
+      return;
+    }
+    g_dbus_method_invocation_return_value(invocation, nullptr);
+    if (method == "Release")
+      channel.registered = false;
+    auto error = Error(Code::Disconnected, "BlueZ closed the RFCOMM profile");
+    if (channel.connecting)
+      FinishOpen(id, Reply::Failure(std::move(error)));
+    else
+      events(ChannelLost{id, std::move(error)});
+  }
+
+  void WatchSocket(Token id, SocketChannel& channel, bool read) {
+    struct Watch {
+      std::weak_ptr<State> state;
+      Token id;
+      bool read;
+    };
+    auto assignment = g_unix_fd_add_full(G_PRIORITY_DEFAULT, channel.fd,
+        static_cast<GIOCondition>((read ? G_IO_IN : G_IO_OUT) | G_IO_HUP | G_IO_ERR),
+        [](gint, GIOCondition condition, gpointer data) -> gboolean {
+          const auto& watch = *static_cast<Watch*>(data);
+          if (auto state = watch.state.lock(); state && state->channels.contains(watch.id)) {
+            auto& channel = *state->channels.at(watch.id);
+            (watch.read ? channel.read_source : channel.write_source) = 0;
+            if (channel.connecting)
+              state->CompleteL2cap(watch.id, channel);
+            else if (watch.read)
+              state->Receive(watch.id, channel, condition);
+            else
+              state->Send(watch.id, channel);
+          }
+          return G_SOURCE_REMOVE;
+        }, new Watch{weak_from_this(), id, read}, [](gpointer data) { delete static_cast<Watch*>(data); });
+    (read ? channel.read_source : channel.write_source) = assignment;
+  }
+
+  void Receive(Token id, SocketChannel& channel, GIOCondition condition) {
+    Bytes value(channel_read_size);
+    for (;;) {
+      const auto size = recv(channel.fd, value.data(), value.size(), channel.packet ? MSG_TRUNC : 0);
+      if (size < 0 && errno == EINTR)
+        continue;
+      if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (condition & (G_IO_HUP | G_IO_ERR)) {
+          std::exchange(channel.reading, {})(Fail(Code::Disconnected, "The Bluetooth socket closed"));
+        } else {
+          WatchSocket(id, channel, true);
+        }
+        return;
+      }
+      if (size < 0) {
+        std::exchange(channel.reading, {})(Reply::Failure(SocketError(errno, Code::Disconnected)));
+      } else if (static_cast<std::size_t>(size) > value.size()) {
+        std::exchange(channel.reading, {})(Fail(Code::PlatformFailure, "The LE L2CAP SDU exceeded the receive limit"));
+      } else {
+        if (size == 0 && channel.packet && !(condition & (G_IO_HUP | G_IO_ERR))) {
+          WatchSocket(id, channel, true);
+          return;
+        }
+        if (size == 0 && channel.packet) {
+          std::exchange(channel.reading, {})(Fail(Code::Disconnected, "The LE L2CAP socket closed"));
+        } else {
+          value.resize(size);
+          std::exchange(channel.reading, {})(Ok(std::move(value)));
+        }
+      }
+      return;
+    }
+  }
+
+  void Send(Token id, SocketChannel& channel) {
+    while (channel.written < channel.output.size()) {
+      const auto remaining = channel.output.size() - channel.written;
+      const auto count = channel.packet ? std::min<std::size_t>(remaining, channel.transmit_limit) : remaining;
+      const auto written = send(channel.fd, channel.output.data() + channel.written, count, MSG_NOSIGNAL);
+      if (written < 0 && errno == EINTR)
+        continue;
+      if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        WatchSocket(id, channel, false);
+        return;
+      }
+      if (written <= 0 || (channel.packet && static_cast<std::size_t>(written) != count)) {
+        std::exchange(channel.writing, {})(Reply::Failure(SocketError(written < 0 ? errno : EIO, Code::Disconnected)));
+        return;
+      }
+      channel.written += written;
+    }
+    channel.output = {};
+    std::exchange(channel.writing, {})(Ok());
+  }
+
+  void SocketIo(Request request, Completion reply) {
+    const auto id = request.link;
+    const auto found = channels.find(id);
+    if (found == channels.end() || found->second->connecting || found->second->fd < 0) {
+      reply(Fail(Code::Disconnected, "The Bluetooth socket is closed"));
+      return;
+    }
+    auto& channel = *found->second;
+    if (request.operation == Operation::ChannelRead) {
+      channel.reading = std::move(reply);
+      WatchSocket(id, channel, true);
+    } else {
+      channel.writing = std::move(reply);
+      channel.output = std::move(request.value);
+      channel.written = 0;
+      Send(id, channel);
+    }
+  }
+
+  void CloseChannel(Token id) {
+    std::erase_if(queued, [id](const auto& item) { return item.second.first.link == id; });
+    const auto found = channels.find(id);
+    if (found == channels.end())
+      return;
+    auto& channel = *found->second;
+    if (!channel.packet && channel.object && !channel.registered && channel.connecting) {
+      channel.retiring = true;
+      channel.opening = {};
+      return;
+    }
+    RemoveChannel(id);
+  }
+
+  void RemoveChannel(Token id) {
+    auto entry = channels.extract(id);
+    const auto& channel = *entry.mapped();
+    if (channel.registered) {
+      Call(channel.profile_manager.get(), "UnregisterProfile", g_variant_new("(o)", channel.object_path.c_str()),
+           [](Variant, auto) {});
+    }
+    auto path = channel.device;
+    entry.mapped().reset();
+    ReleaseDevice(path);
   }
 
   void StartScan(Request request, Completion reply) {
@@ -427,8 +893,10 @@ struct State : std::enable_shared_from_this<State> {
       return [device] { Call(device.get(), "CancelPairing", nullptr, [](Variant, auto) {}); };
     } else {
       const bool connected = Flag(device.get(), "Connected");
-      auto& link = links.emplace(request.link, Link{.path = std::move(request.device), .device = device,
-                                                    .connecting = std::move(reply), .owns_connection = !connected})
+      const bool owned = held_connections.erase(request.device) != 0;
+      auto& link = links.emplace(request.link, Link{.path = request.device, .device = device,
+                                                    .connecting = std::move(reply),
+                                                    .owns_connection = !connected || owned})
                        .first->second;
       if (connected) {
         link.waiting_for_connect_reply = false;
@@ -594,17 +1062,41 @@ struct State : std::enable_shared_from_this<State> {
   void Disconnect(Token link) {
     std::erase_if(queued, [link](const auto& item) { return item.second.first.link == link; });
     auto entry = links.extract(link);
-    if (!entry.empty())
-      Cleanup(entry.mapped());
+    if (entry.empty())
+      return;
+    const auto& removed = entry.mapped();
+    CleanupNotifications(removed);
+    if (removed.owns_connection)
+      held_connections.insert_or_assign(removed.path, removed.device);
+    ReleaseDevice(removed.path);
   }
 
-  static void Cleanup(const Link& link) {
+  void ReleaseDevice(const std::string& path) {
+    if (std::ranges::any_of(channels, [&](const auto& entry) { return entry.second->device == path; }) ||
+        std::ranges::any_of(links, [&](const auto& entry) { return entry.second.path == path; }))
+      return;
+    if (auto owner = held_connections.extract(path); !owner.empty()) {
+      retiring_devices.insert(path);
+      Call(owner.mapped().get(), "Disconnect", nullptr, [weak = weak_from_this(), path](Variant, auto) {
+        if (auto state = weak.lock()) {
+          state->retiring_devices.erase(path);
+          auto pending = std::ranges::find_if(state->queued, [&](const auto& entry) {
+            return entry.second.first.operation == Operation::Connect && entry.second.first.device == path;
+          });
+          if (pending != state->queued.end()) {
+            auto request = state->queued.extract(pending);
+            state->Invoke(std::move(request.mapped().first), std::move(request.mapped().second));
+          }
+        }
+      });
+    }
+  }
+
+  static void CleanupNotifications(const Link& link) {
     for (const auto attribute : link.notifications) {
       if (const auto found = link.attributes.find(attribute); found != link.attributes.end())
         Call(found->second.get(), "StopNotify", nullptr, [](Variant, auto) {});
     }
-    if (link.owns_connection)
-      Call(link.device.get(), "Disconnect", nullptr, [](Variant, auto) {});
   }
 
   BackendEvents events;
@@ -617,6 +1109,9 @@ struct State : std::enable_shared_from_this<State> {
   Token scan = 0;
   std::map<Token, std::pair<Request, Completion>> queued;
   std::map<Token, Link> links;
+  std::map<Token, std::unique_ptr<SocketChannel>> channels;
+  std::map<std::string, std::shared_ptr<GDBusProxy>> held_connections;
+  std::set<std::string> retiring_devices;
 };
 
 class LinuxBackend final : public Backend {
@@ -660,6 +1155,10 @@ public:
     state_->Disconnect(link);
   }
 
+  void CloseChannel(Token id) override {
+    state_->CloseChannel(id);
+  }
+
 private:
   std::shared_ptr<State> state_;
   std::unique_ptr<PeripheralBackend> peripheral_;
@@ -669,7 +1168,8 @@ private:
 
 BluetoothCapabilities PlatformCapabilities() {
   return {.can_scan = true, .can_restore_device = true, .can_pair = true, .can_query_bond = true,
-          .can_use_gatt_client = true, .can_access_descriptors = true};
+          .can_use_gatt_client = true, .can_access_descriptors = true, .can_list_paired_rfcomm_devices = true,
+          .can_connect_rfcomm = true, .can_connect_le_l2cap = true};
 }
 
 void RegisterPlatform(ApplicationContext&) {}

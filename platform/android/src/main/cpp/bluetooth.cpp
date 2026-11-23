@@ -3,6 +3,8 @@
 #include <huxerui/android/platform_registry.h>
 #include <huxerui/state.h>
 
+#include <android/api-level.h>
+
 #include <utility>
 
 namespace huxerui::bluetooth::detail {
@@ -39,6 +41,11 @@ const char* Method(Operation operation) {
     case Operation::Advertise: return "advertise";
     case Operation::OpenServer: return "open_server";
     case Operation::SendNotification: return "send_notification";
+    case Operation::ListRfcomm: return "list_rfcomm";
+    case Operation::OpenRfcomm: return "open_rfcomm";
+    case Operation::OpenL2cap: return "open_l2cap";
+    case Operation::ChannelRead: return "channel_read";
+    case Operation::ChannelWrite: return "channel_write";
   }
   throw std::logic_error("Unknown Android Bluetooth operation");
 }
@@ -76,7 +83,7 @@ PlatformPayload Encode(const Request& request) {
       {"link", request.link}, {"attribute", request.attribute}, {"scan", request.scan},
       {"device", request.device}, {"services", std::move(services)}, {"descriptor", request.descriptor},
       {"enabled", request.enabled}, {"response", request.write_mode == GattWriteMode::WithResponse},
-      {"value", request.value}};
+      {"value", request.value}, {"uuid", request.service_uuid}, {"psm", request.psm}};
 }
 
 std::optional<std::string> ReadText(const PlatformPayload& value) {
@@ -158,7 +165,14 @@ Reply Decode(Operation operation, const PlatformPayload& value) {
     case Operation::Bond: return Ok(static_cast<BondState>(value.AsInteger()));
     case Operation::Connect: return Ok(ReadLimits(value));
     case Operation::Discover: return Ok(ReadDiscovery(value));
-    case Operation::Read: return Ok(ReadBytes(value));
+    case Operation::Read:
+    case Operation::ChannelRead: return Ok(ReadBytes(value));
+    case Operation::ListRfcomm: {
+      std::vector<FoundDevice> devices;
+      for (const auto& device : value.AsList())
+        devices.push_back(ReadDevice(device));
+      return Ok(std::move(devices));
+    }
     default: return Ok();
   }
 }
@@ -166,6 +180,7 @@ Reply Decode(Operation operation, const PlatformPayload& value) {
 struct Bridge {
   AdapterStatus status = AdapterStatus::Unknown;
   State<BluetoothCapabilities> peripheral{BluetoothCapabilities{}};
+  std::optional<BluetoothCapabilities> channels;
   BackendEvents events;
 
   void Status(const PlatformPayload& value) {
@@ -177,6 +192,9 @@ struct Bridge {
       peripheral = BluetoothCapabilities{.can_advertise = advertising, .can_use_gatt_server = server,
                                          .can_advertise_standalone = advertising};
     }
+    const bool classic = object.at("classic").AsBoolean();
+    channels = BluetoothCapabilities{.can_list_paired_rfcomm_devices = classic, .can_connect_rfcomm = classic,
+                                     .can_connect_le_l2cap = object.at("l2cap").AsBoolean()};
     status = static_cast<AdapterStatus>(object.at("status").AsInteger());
     events(status);
   }
@@ -271,6 +289,10 @@ public:
     return bridge_->peripheral;
   }
 
+  BluetoothCapabilities ChannelCapabilities() const override {
+    return bridge_->channels.value_or(PlatformCapabilities());
+  }
+
   Cancellation Invoke(Request request, Completion completion) override {
     const auto ticket = channel_.Invoke(Method(request.operation), Encode(request),
                                         [operation = request.operation, reply = std::move(completion)]
@@ -300,6 +322,10 @@ public:
     Control("stop_advertising", advertisement);
   }
 
+  void CloseChannel(Token channel) override {
+    Control("close_channel", channel);
+  }
+
   void CloseServer(Token server) override {
     Control("close_server", server);
   }
@@ -319,7 +345,8 @@ using OpenAndroidModule = std::function<std::unique_ptr<Backend>(BackendEvents)>
 
 BluetoothCapabilities PlatformCapabilities() {
   return {.can_scan = true, .can_restore_device = true, .can_pair = true, .can_query_bond = true,
-          .can_use_gatt_client = true, .can_access_descriptors = true};
+          .can_use_gatt_client = true, .can_access_descriptors = true, .can_list_paired_rfcomm_devices = true,
+          .can_connect_rfcomm = true, .can_connect_le_l2cap = android_get_device_api_level() >= 29};
 }
 
 void RegisterPlatform(ApplicationContext& context) {

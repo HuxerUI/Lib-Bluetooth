@@ -5,10 +5,13 @@
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Bluetooth.Rfcomm.h>
 #include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.Metadata.h>
+#include <winrt/Windows.Networking.h>
+#include <winrt/Windows.Networking.Sockets.h>
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
@@ -25,10 +28,12 @@ namespace {
 using namespace winrt::Windows::Devices::Bluetooth;
 using namespace winrt::Windows::Devices::Bluetooth::Advertisement;
 using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
+using namespace winrt::Windows::Devices::Bluetooth::Rfcomm;
 using namespace winrt::Windows::Devices::Enumeration;
 using namespace winrt::Windows::Devices::Radios;
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Foundation::Metadata;
+using namespace winrt::Windows::Networking::Sockets;
 using namespace winrt::Windows::Storage::Streams;
 
 using Code = BluetoothErrorCode;
@@ -70,6 +75,10 @@ BluetoothError WindowsError(const winrt::hresult_error& error) {
     code = Code::PermissionDenied;
   else if (value == 0x800704c7)
     code = Code::Canceled;
+  else if (value == 0x800700aa)
+    code = Code::Busy;
+  else if (value == 0x80072745 || value == 0x80072746 || value == 0x80072749)
+    code = Code::Disconnected;
   else if (value == 0x800705b4)
     code = Code::TimedOut;
   return Error(code, winrt::to_string(error.message()), "HRESULT", error.code().value);
@@ -587,6 +596,125 @@ struct Link {
   }
 };
 
+constexpr std::string_view classic_prefix = "rfcomm:";
+
+struct RfcommChannel {
+  explicit RfcommChannel(std::string device_id) : device_id(std::move(device_id)) {}
+
+  void Close() {
+    retired.store(true);
+    try {
+      socket.Close();
+    } catch (const winrt::hresult_error&) {
+      // Windows can close the socket before the application releases it.
+    }
+    service = nullptr;
+    device = nullptr;
+  }
+
+  std::string device_id;
+  StreamSocket socket{};
+  BluetoothDevice device{nullptr};
+  RfcommDeviceService service{nullptr};
+  std::atomic<bool> retired{false};
+  bool connecting = true;
+};
+
+winrt::fire_and_forget ListRfcommDevices(Completion reply) {
+  try {
+    auto devices = co_await DeviceInformation::FindAllAsync(BluetoothDevice::GetDeviceSelectorFromPairingState(true));
+    std::vector<FoundDevice> result;
+    for (const auto& device : devices)
+      result.push_back({std::string(classic_prefix) + winrt::to_string(device.Id()), Name(device.Name())});
+    reply(Ok(std::move(result)));
+  } catch (const winrt::hresult_error& error) {
+    reply(Reply::Failure(WindowsError(error)));
+  }
+}
+
+winrt::fire_and_forget RestoreRfcommDevice(std::string id, Completion reply) {
+  try {
+    auto device = co_await BluetoothDevice::FromIdAsync(winrt::to_hstring(id.substr(classic_prefix.size())));
+    if (!device || !device.DeviceInformation().Pairing().IsPaired())
+      reply(Fail(Code::DeviceUnavailable, "Windows no longer recognizes this paired Classic device"));
+    else
+      reply(Ok(FoundDevice{std::move(id), Name(device.Name())}));
+  } catch (const winrt::hresult_error& error) {
+    reply(Reply::Failure(WindowsError(error)));
+  }
+}
+
+winrt::fire_and_forget OpenRfcommChannel(TaskScope tasks, std::shared_ptr<RfcommChannel> channel,
+                                       std::string service_uuid, Completion reply) {
+  try {
+    const auto socket = channel->socket;
+    auto device = co_await BluetoothDevice::FromIdAsync(
+        winrt::to_hstring(channel->device_id.substr(classic_prefix.size())));
+    if (channel->retired.load())
+      co_return;
+    if (!device || !device.DeviceInformation().Pairing().IsPaired()) {
+      reply(Fail(Code::DeviceUnavailable, "Windows no longer recognizes this paired Classic device"));
+      co_return;
+    }
+    const auto id = RfcommServiceId::FromUuid(winrt::guid{std::string_view(service_uuid)});
+    auto services = co_await device.GetRfcommServicesForIdAsync(id, BluetoothCacheMode::Uncached);
+    if (channel->retired.load())
+      co_return;
+    if (services.Error() != WinError::Success) {
+      reply(Reply::Failure(ProviderError(services.Error(), "Windows could not resolve the RFCOMM service")));
+      co_return;
+    }
+    if (services.Services().Size() != 1) {
+      reply(services.Services().Size() == 0 ?
+          Fail(Code::DeviceUnavailable, "The RFCOMM service is unavailable on the peer") :
+          Fail(Code::Unsupported, "The RFCOMM UUID resolves to multiple services"));
+      co_return;
+    }
+    auto service = services.Services().GetAt(0);
+    co_await socket.ConnectAsync(service.ConnectionHostName(), service.ConnectionServiceName(),
+                                 SocketProtectionLevel::BluetoothEncryptionWithAuthentication);
+    tasks.Post([channel, device = std::move(device), service = std::move(service), reply = std::move(reply)]() mutable {
+      if (!channel->retired.load()) {
+        channel->device = std::move(device);
+        channel->service = std::move(service);
+        channel->connecting = false;
+        reply(Ok());
+      }
+    });
+  } catch (const winrt::hresult_error& error) {
+    if (!channel->retired.load())
+      reply(Reply::Failure(WindowsError(error)));
+  }
+}
+
+winrt::fire_and_forget RfcommSocketIo(StreamSocket socket, Request request, Completion reply) {
+  try {
+    if (request.operation == Operation::ChannelRead) {
+      auto bytes = co_await socket.InputStream().ReadAsync(Buffer(channel_read_size), channel_read_size,
+                                                          InputStreamOptions::Partial);
+      reply(Ok(BufferBytes(bytes)));
+    } else {
+      const auto output = socket.OutputStream();
+      std::size_t offset = 0;
+      while (offset < request.value.size()) {
+        const auto size = std::min(channel_read_size, request.value.size() - offset);
+        Buffer bytes(static_cast<std::uint32_t>(size));
+        std::memcpy(bytes.data(), request.value.data() + offset, size);
+        bytes.Length(static_cast<std::uint32_t>(size));
+        const auto written = co_await output.WriteAsync(bytes);
+        if (written == 0 || written > size) {
+          reply(Fail(Code::Disconnected, "The Windows RFCOMM socket stopped accepting data"));
+          co_return;
+        }
+        offset += written;
+      }
+      reply(Ok());
+    }
+  } catch (const winrt::hresult_error& error) {
+    reply(Reply::Failure(WindowsError(error)));
+  }
+}
+
 struct State : std::enable_shared_from_this<State> {
   State(TaskScope scope, BackendEvents receive) : tasks(std::move(scope)), events(std::move(receive)) {}
 
@@ -609,7 +737,7 @@ struct State : std::enable_shared_from_this<State> {
   static winrt::fire_and_forget Initialize(std::shared_ptr<State> state) {
     try {
       auto adapter = co_await BluetoothAdapter::GetDefaultAsync();
-      if (!adapter || !adapter.IsLowEnergySupported()) {
+      if (!adapter || (!adapter.IsLowEnergySupported() && !adapter.IsClassicSupported())) {
         if (!state->disposed)
           state->SetStatus(AdapterStatus::Unavailable);
         co_return;
@@ -617,7 +745,8 @@ struct State : std::enable_shared_from_this<State> {
       auto radio = co_await adapter.GetRadioAsync();
       if (state->disposed || !radio)
         co_return;
-      state->supports_peripheral = adapter.IsPeripheralRoleSupported() &&
+      state->supports_classic = adapter.IsClassicSupported();
+      state->supports_peripheral = adapter.IsLowEnergySupported() && adapter.IsPeripheralRoleSupported() &&
           ApiInformation::IsTypePresent(L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProvider");
       state->radio = radio;
       state->radio_token = radio.StateChanged([weak = state->weak_from_this(), tasks = state->tasks](auto&&, auto&&) {
@@ -923,6 +1052,38 @@ struct State : std::enable_shared_from_this<State> {
 
   Cancellation Invoke(Request request, Completion reply) {
     try {
+      if (request.operation == Operation::ListRfcomm) {
+        ListRfcommDevices(std::move(reply));
+        return {};
+      }
+      if (request.operation == Operation::Restore && request.device.starts_with(classic_prefix)) {
+        RestoreRfcommDevice(std::move(request.device), std::move(reply));
+        return {};
+      }
+      if (request.operation == Operation::OpenRfcomm) {
+        if (!request.device.starts_with(classic_prefix)) {
+          reply(Fail(Code::DeviceUnavailable, "The device has no paired Classic identity"));
+          return {};
+        }
+        if (std::ranges::any_of(channels, [&](const auto& entry) {
+              return entry.second->connecting && entry.second->device_id == request.device;
+            })) {
+          reply(Fail(Code::Busy, "An RFCOMM open is already in progress for this device"));
+          return {};
+        }
+        auto channel = std::make_shared<RfcommChannel>(std::move(request.device));
+        channels.emplace(request.link, channel);
+        OpenRfcommChannel(tasks, std::move(channel), std::move(request.service_uuid), std::move(reply));
+        return {};
+      }
+      if (request.operation == Operation::ChannelRead || request.operation == Operation::ChannelWrite) {
+        const auto found = channels.find(request.link);
+        if (found == channels.end() || found->second->connecting)
+          reply(Fail(Code::Disconnected, "The RFCOMM channel is closed"));
+        else
+          RfcommSocketIo(found->second->socket, std::move(request), std::move(reply));
+        return {};
+      }
       if (request.operation == Operation::Scan) {
         StartScan(request.scan, reply);
         return {};
@@ -958,6 +1119,11 @@ struct State : std::enable_shared_from_this<State> {
       entry.mapped()->Close();
   }
 
+  void CloseChannel(Token id) {
+    if (auto channel = channels.extract(id); !channel.empty())
+      channel.mapped()->Close();
+  }
+
   void Dispose() {
     disposed = true;
     StopScan(scan);
@@ -969,12 +1135,15 @@ struct State : std::enable_shared_from_this<State> {
     }
     while (!links.empty())
       Disconnect(links.begin()->first);
+    while (!channels.empty())
+      CloseChannel(channels.begin()->first);
   }
 
   TaskScope tasks;
   BackendEvents events;
   bool disposed = false;
   bool supports_peripheral = false;
+  std::optional<bool> supports_classic;
   AdapterStatus status = AdapterStatus::Unknown;
   Radio radio{nullptr};
   std::optional<winrt::event_token> radio_token;
@@ -984,13 +1153,14 @@ struct State : std::enable_shared_from_this<State> {
   Token scan = 0;
   Token next = 1;
   std::map<Token, std::shared_ptr<Link>> links;
+  std::map<Token, std::shared_ptr<RfcommChannel>> channels;
 };
 
 class WindowsBackend final : public Backend {
 public:
   WindowsBackend(TaskScope tasks, BackendEvents events)
       : state_(std::make_shared<State>(std::move(tasks), std::move(events))) {
-    if (PlatformCapabilities().can_use_gatt_client)
+    if (auto caps = PlatformCapabilities(); caps.can_use_gatt_client || caps.can_connect_rfcomm)
       State::Initialize(state_);
     else
       state_->status = AdapterStatus::Unavailable;
@@ -1004,6 +1174,19 @@ public:
 
   AdapterStatus Status() const override {
     return state_->status;
+  }
+
+  BluetoothCapabilities ChannelCapabilities() const override {
+    auto capabilities = PlatformCapabilities();
+    if (state_->supports_classic == false) {
+      capabilities.can_list_paired_rfcomm_devices = false;
+      capabilities.can_connect_rfcomm = false;
+    }
+    return capabilities;
+  }
+
+  void CloseChannel(Token id) override {
+    state_->CloseChannel(id);
   }
 
   BluetoothCapabilities PeripheralCapabilities() const override {
@@ -1080,8 +1263,17 @@ BluetoothCapabilities PlatformCapabilities() {
       return false;
     }
   }();
-  return {.can_scan = supported, .can_restore_device = supported, .can_pair = supported, .can_query_bond = supported,
-          .can_use_gatt_client = supported, .can_access_descriptors = supported};
+  static const bool rfcomm = [] {
+    try {
+      return ApiInformation::IsMethodPresent(L"Windows.Devices.Bluetooth.BluetoothDevice",
+                                             L"GetRfcommServicesForIdAsync", 2);
+    } catch (const winrt::hresult_error&) {
+      return false;
+    }
+  }();
+  return {.can_scan = supported, .can_restore_device = supported || rfcomm, .can_pair = supported,
+          .can_query_bond = supported, .can_use_gatt_client = supported, .can_access_descriptors = supported,
+          .can_list_paired_rfcomm_devices = rfcomm, .can_connect_rfcomm = rfcomm};
 }
 
 void RegisterPlatform(ApplicationContext&) {}

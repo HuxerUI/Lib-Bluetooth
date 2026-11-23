@@ -46,6 +46,10 @@ std::optional<std::string> NormalizeUuid(std::string_view input) {
   return uuid;
 }
 
+BluetoothCapabilities Backend::ChannelCapabilities() const {
+  return PlatformCapabilities();
+}
+
 namespace {
 
 constexpr std::size_t max_pending_gatt_requests = 64;
@@ -169,6 +173,24 @@ struct Session {
   bool connect_complete = false;
 };
 
+struct Channel {
+  std::weak_ptr<Service> service;
+  Token id;
+  EventHandler<BluetoothChannelClosed> handler;
+  Bytes received;
+  std::size_t offset = 0;
+  std::optional<CallbackCompletion<std::optional<BluetoothError>>> reader;
+  std::optional<BluetoothError> close_reason;
+  bool acquired = false;
+  bool reading = false;
+  bool receiving = false;
+  Cancellation receive_cancel;
+  bool output_ended = false;
+  bool eof = false;
+  bool closed = false;
+  bool notified = false;
+};
+
 struct AdapterWatch {
   EventHandler<AdapterStatus> handler;
   CallbackCompletion<void> end;
@@ -189,6 +211,10 @@ struct Access {
 
   static GattSession MakeSession(std::shared_ptr<Session> session) {
     return GattSession(std::move(session));
+  }
+
+  static BluetoothChannel MakeChannel(std::shared_ptr<Channel> channel) {
+    return BluetoothChannel(std::move(channel));
   }
 
   static AdvertisingSession MakeAdvertisement(std::shared_ptr<PeripheralSession> session) {
@@ -297,6 +323,7 @@ struct Service : std::enable_shared_from_this<Service> {
   explicit Service(TaskScope scope) : tasks(std::move(scope)) {}
 
   ~Service() {
+    EndChannels(Error(Code::Unavailable, "Bluetooth service closed"));
     EndPeripherals(Error(Code::Unavailable, "Bluetooth service closed"));
     while (!reconnects.empty())
       CancelReconnect(reconnects.begin()->first, Error(Code::Unavailable, "Bluetooth service closed"));
@@ -330,12 +357,128 @@ struct Service : std::enable_shared_from_this<Service> {
 
   void EnterBackground() {
     ++background_generation;
+    EndChannels(Error(Code::Canceled, "Bluetooth channels closed when the application entered the background"));
     EndPeripherals(PeripheralEndReason::Backgrounded);
     if (scan)
       EndScan(scan->id, ScanEndReason::Stopped, true);
     while (!reconnects.empty()) {
       CancelReconnect(reconnects.begin()->first,
                       Error(Code::Canceled, "Bluetooth recovery ended when the application entered the background"));
+    }
+  }
+
+  void NotifyChannel(const std::shared_ptr<Channel>& channel, std::optional<BluetoothError> error) {
+    if (std::exchange(channel->notified, true) || !channel->acquired || !channel->handler)
+      return;
+    tasks.Post([weak = std::weak_ptr<Channel>(channel), error = std::move(error)]() mutable {
+      if (auto channel = weak.lock(); channel && channel->handler) {
+        auto handler = std::exchange(channel->handler, {});
+        (*handler)(BluetoothChannelClosed{std::move(error)});
+      }
+    });
+  }
+
+  void FinishChannelWork(Token channel, const BluetoothError& error, bool writes_only) {
+    std::vector<Token> retired;
+    for (const auto& [id, work] : requests) {
+      if (work.request.link == channel &&
+          (work.request.operation == Operation::ChannelWrite ||
+           (!writes_only && IsChannelOpen(work.request.operation)))) {
+        retired.push_back(id);
+      }
+    }
+    for (const auto id : retired)
+      Finish(id, Reply::Failure(error), true);
+  }
+
+  void CloseChannel(std::shared_ptr<Channel> channel, std::optional<BluetoothError> error = {}) {
+    if (std::exchange(channel->closed, true))
+      return;
+    channels.erase(channel->id);
+    if (auto cancel = std::exchange(channel->receive_cancel, {}))
+      cancel();
+    channel->received = {};
+    const auto reason = error.value_or(Error(Code::Canceled, "The Bluetooth channel was closed"));
+    channel->close_reason = reason;
+    if (channel->reader)
+      channel->reader->Complete(reason);
+    FinishChannelWork(channel->id, reason, false);
+    if (backend && !channel->eof)
+      backend->CloseChannel(channel->id);
+    NotifyChannel(channel, std::move(error));
+  }
+
+  void EndChannels(const BluetoothError& error) {
+    while (!channels.empty())
+      CloseChannel(channels.begin()->second, error);
+    std::vector<Token> listings;
+    for (const auto& [id, work] : requests)
+      if (work.request.operation == Operation::ListRfcomm)
+        listings.push_back(id);
+    for (const auto id : listings)
+      Finish(id, Reply::Failure(error), true);
+  }
+
+  void ChannelDrained(const std::shared_ptr<Channel>& channel) {
+    if (channel->acquired && channel->eof && !channel->closed && channel->received.empty()) {
+      channels.erase(channel->id);
+      NotifyChannel(channel, {});
+    }
+  }
+
+  void EndChannelOutput(const std::shared_ptr<Channel>& channel) {
+    if (!std::exchange(channel->output_ended, true))
+      FinishChannelWork(channel->id, Error(Code::Disconnected, "The peer closed the Bluetooth channel output"), true);
+  }
+
+  void EndChannelInput(const std::shared_ptr<Channel>& channel) {
+    if (std::exchange(channel->eof, true))
+      return;
+    EndChannelOutput(channel);
+    if (auto cancel = std::exchange(channel->receive_cancel, {}))
+      cancel();
+    channel->receiving = false;
+    backend->CloseChannel(channel->id);
+    if (channel->reader)
+      channel->reader->Complete(std::nullopt);
+    ChannelDrained(channel);
+  }
+
+  void Received(Token id, Reply reply) {
+    const auto found = channels.find(id);
+    if (found == channels.end() || found->second->eof)
+      return;
+    const auto channel = found->second;
+    channel->receiving = false;
+    channel->receive_cancel = {};
+    auto result = Take<Bytes>(std::move(reply));
+    if (!result.Succeeded()) {
+      CloseChannel(channel, std::move(result).Error());
+      return;
+    }
+    channel->received = std::move(result).Value();
+    channel->offset = 0;
+    if (channel->received.empty())
+      EndChannelInput(channel);
+    else if (channel->reader)
+      channel->reader->Complete(std::nullopt);
+  }
+
+  void PumpChannel(const std::shared_ptr<Channel>& channel) {
+    if (channel->closed || channel->eof || channel->receiving || !channel->received.empty())
+      return;
+    channel->receiving = true;
+    try {
+      channel->receive_cancel = backend->Invoke(
+          Request{.operation = Operation::ChannelRead, .link = channel->id},
+          [weak = weak_from_this(), tasks = tasks, id = channel->id](Reply reply) mutable {
+        tasks.Post([weak, id, reply = std::move(reply)]() mutable {
+          if (auto service = weak.lock())
+            service->Received(id, std::move(reply));
+        });
+      });
+    } catch (const std::exception& error) {
+      CloseChannel(channel, Error(Code::PlatformFailure, error.what()));
     }
   }
 
@@ -360,6 +503,10 @@ struct Service : std::enable_shared_from_this<Service> {
       return {};
     auto capabilities = PlatformCapabilities();
     if (backend) {
+      const auto channel = backend->ChannelCapabilities();
+      capabilities.can_list_paired_rfcomm_devices = channel.can_list_paired_rfcomm_devices;
+      capabilities.can_connect_rfcomm = channel.can_connect_rfcomm;
+      capabilities.can_connect_le_l2cap = channel.can_connect_le_l2cap;
       const auto peripheral = backend->PeripheralCapabilities();
       capabilities.can_advertise = peripheral.can_advertise;
       capabilities.can_advertise_standalone = peripheral.can_advertise_standalone;
@@ -377,6 +524,11 @@ struct Service : std::enable_shared_from_this<Service> {
       case Operation::Restore: supported = caps.can_restore_device; break;
       case Operation::Bond: supported = caps.can_query_bond; break;
       case Operation::Pair: supported = caps.can_pair; break;
+      case Operation::ListRfcomm: supported = caps.can_list_paired_rfcomm_devices; break;
+      case Operation::OpenRfcomm: supported = caps.can_connect_rfcomm; break;
+      case Operation::OpenL2cap: supported = caps.can_connect_le_l2cap; break;
+      case Operation::ChannelRead:
+      case Operation::ChannelWrite: supported = true; break;
       case Operation::Advertise: supported = caps.can_advertise; break;
       case Operation::OpenServer:
       case Operation::SendNotification: supported = caps.can_use_gatt_server; break;
@@ -386,7 +538,8 @@ struct Service : std::enable_shared_from_this<Service> {
       return Error(Code::Unavailable, "Bluetooth backend could not be opened");
     if (!supported)
       return Error(Code::Unsupported, "This Bluetooth operation is unavailable on the current platform");
-    if (status == AdapterStatus::PoweredOff && operation != Operation::Restore && operation != Operation::Bond)
+    if (status == AdapterStatus::PoweredOff && operation != Operation::Restore && operation != Operation::Bond &&
+        operation != Operation::ListRfcomm)
       return Error(Code::AdapterOff, "The Bluetooth adapter is off");
     if (!backend || status == AdapterStatus::Unavailable)
       return Error(Code::Unavailable, "The Bluetooth adapter is unavailable");
@@ -403,6 +556,7 @@ struct Service : std::enable_shared_from_this<Service> {
       if (scan)
         EndScan(scan->id, error, true);
       EndPeripherals(error);
+      EndChannels(error);
       while (!links.empty())
         CloseLink(links.begin()->second, error, true);
     }
@@ -452,6 +606,22 @@ struct Service : std::enable_shared_from_this<Service> {
     const auto found = links.find(event.link);
     if (found != links.end())
       CloseLink(found->second, std::move(event.error), true);
+  }
+
+  void Handle(ChannelStreamEnded event) {
+    const auto found = channels.find(event.channel);
+    if (found == channels.end())
+      return;
+    const auto channel = found->second;
+    if (event.input)
+      EndChannelInput(channel);
+    else
+      EndChannelOutput(channel);
+  }
+
+  void Handle(ChannelLost event) {
+    if (const auto found = channels.find(event.channel); found != channels.end() && !found->second->eof)
+      CloseChannel(found->second, std::move(event.error));
   }
 
   void Handle(ServicesChanged event) {
@@ -699,7 +869,11 @@ struct Service : std::enable_shared_from_this<Service> {
     }
     work.started = true;
     try {
-      work.cancel = backend->Invoke(request, [weak = weak_from_this(), tasks = tasks, id](Reply reply) mutable {
+      auto send = request.operation == Operation::ChannelWrite ? std::move(work.request.value) : Bytes{};
+      Request dispatch = request;
+      if (request.operation == Operation::ChannelWrite)
+        dispatch.value = std::move(send);
+      work.cancel = backend->Invoke(std::move(dispatch), [weak = weak_from_this(), tasks = tasks, id](Reply reply) mutable {
         tasks.Post([weak, id, reply = std::move(reply)]() mutable {
           if (auto service = weak.lock())
             service->Finish(id, std::move(reply));
@@ -757,6 +931,10 @@ struct Service : std::enable_shared_from_this<Service> {
         CloseLink(session, Error(Code::Disconnected, "Session closed after an interrupted GATT request"), true);
       }
     }
+    if (work.request.operation == Operation::ChannelWrite && work.started && !reply.Succeeded()) {
+      if (const auto found = channels.find(work.request.link); found != channels.end() && !found->second->output_ended)
+        CloseChannel(found->second, reply.Error());
+    }
     work.done(std::move(reply));
     if (session)
       Pump(session);
@@ -782,6 +960,23 @@ struct Service : std::enable_shared_from_this<Service> {
     if (options.timeout <= std::chrono::milliseconds::zero()) {
       done.Complete(Fail(Code::InvalidArgument, "The operation timeout must be positive"));
       return {};
+    }
+    if (request.operation == Operation::ChannelWrite) {
+      const auto channel = channels.find(request.link);
+      if (channel == channels.end() || channel->second->output_ended) {
+        done.Complete(Fail(Code::Disconnected, "The Bluetooth channel is closed"));
+        return {};
+      }
+      if (std::ranges::any_of(requests, [&](const auto& item) {
+            return item.second.request.operation == Operation::ChannelWrite && item.second.request.link == request.link;
+          })) {
+        done.Complete(Fail(Code::Busy, "A Bluetooth channel write is already pending"));
+        return {};
+      }
+      if (request.value.empty()) {
+        done.Complete(Ok());
+        return {};
+      }
     }
     std::shared_ptr<Session> session;
     if (IsGattOperation(request.operation)) {
@@ -826,6 +1021,7 @@ struct Service : std::enable_shared_from_this<Service> {
   std::map<Token, AdapterWatch> watches;
   std::shared_ptr<Scan> scan;
   std::map<Token, std::shared_ptr<Session>> links;
+  std::map<Token, std::shared_ptr<Channel>> channels;
   std::map<Token, std::shared_ptr<PeripheralSession>> peripherals;
   std::map<Token, Work> requests;
   std::map<Token, PendingReconnect> reconnects;
@@ -1056,6 +1252,136 @@ template <class T> Task<BluetoothResult<T>> DeviceOperation(std::weak_ptr<Servic
     co_return BluetoothResult<T>::Failure(Error(Code::DeviceUnavailable, "The device belongs to another backend"));
   service.reset();
   co_return Take<T>(co_await Run(weak, Request{.operation = operation, .device = device.Id()}, options));
+}
+
+Task<BluetoothResult<std::vector<Device>>> ListRfcomm(std::weak_ptr<Service> weak, OperationOptions options) {
+  using Result = BluetoothResult<std::vector<Device>>;
+  if (UseApplication().LifecycleState() != ApplicationLifecycleState::Active)
+    co_return Result::Failure(Error(Code::Unavailable, "Listing paired devices requires an active application"));
+  auto result = Take<std::vector<FoundDevice>>(co_await Run(weak, Request{.operation = Operation::ListRfcomm}, options));
+  if (!result.Succeeded())
+    co_return Result::Failure(std::move(result).Error());
+  auto service = weak.lock();
+  if (!service)
+    co_return Result::Failure(Error(Code::Unavailable, "Bluetooth service closed"));
+  std::vector<Device> devices;
+  for (auto& device : result.Value())
+    if (!device.id.empty())
+      devices.push_back(Access::MakeDevice(service, std::move(device)));
+  co_return Result::Success(std::move(devices));
+}
+
+Task<BluetoothResult<BluetoothChannel>> OpenChannel(
+    std::weak_ptr<Service> weak, Device device, Request request, OperationOptions options,
+    std::function<void(BluetoothChannelClosed)> on_closed) {
+  using Result = BluetoothResult<BluetoothChannel>;
+  auto service = weak.lock();
+  if (!service)
+    co_return Result::Failure(Error(Code::Unavailable, "Bluetooth service closed"));
+  if (!Access::From(device, service))
+    co_return Result::Failure(Error(Code::InvalidArgument, "The device belongs to another Bluetooth backend"));
+  if (UseApplication().LifecycleState() != ApplicationLifecycleState::Active)
+    co_return Result::Failure(Error(Code::Unavailable, "Opening a Bluetooth channel requires an active application"));
+  if (request.operation == Operation::OpenRfcomm) {
+    auto uuid = NormalizeUuid(request.service_uuid);
+    if (!uuid)
+      co_return Result::Failure(Error(Code::InvalidArgument, "The RFCOMM service UUID is invalid"));
+    request.service_uuid = std::move(*uuid);
+  } else if (request.psm == 0 || request.psm > 0xff) {
+    co_return Result::Failure(Error(Code::InvalidArgument, "The LE L2CAP PSM is out of range"));
+  }
+  auto channel = std::make_shared<Channel>();
+  channel->service = service;
+  channel->id = service->next++;
+  if (on_closed)
+    channel->handler = std::make_shared<decltype(on_closed)>(std::move(on_closed));
+  service->channels.emplace(channel->id, channel);
+  request.link = channel->id;
+  request.device = device.Id();
+  auto owner = Access::MakeChannel(channel);
+  service.reset();
+  auto result = co_await Run(weak, std::move(request), options);
+  if (!result.Succeeded())
+    co_return Result::Failure(std::move(result).Error());
+  service = weak.lock();
+  if (!service || channel->closed)
+    co_return Result::Failure(Error(Code::Disconnected, "The Bluetooth channel closed during setup"));
+  channel->acquired = true;
+  service->ChannelDrained(channel);
+  service->PumpChannel(channel);
+  co_return Result::Success(std::move(owner));
+}
+
+void ReleaseChannel(const std::shared_ptr<Channel>& channel, bool notify) {
+  if (!channel)
+    return;
+  if (!notify)
+    channel->handler.reset();
+  if (auto service = channel->service.lock())
+    service->CloseChannel(channel);
+}
+
+struct ChannelReadSlot {
+  Channel& channel;
+  TaskHandle deadline;
+
+  ~ChannelReadSlot() {
+    deadline.Cancel();
+    channel.reader.reset();
+    channel.reading = false;
+  }
+};
+
+Task<BluetoothResult<Bytes>> ReadChannel(std::shared_ptr<Channel> channel, std::size_t maximum,
+                                         OperationOptions options) {
+  using Result = BluetoothResult<Bytes>;
+  if (maximum == 0 || options.timeout <= std::chrono::milliseconds::zero())
+    co_return Result::Failure(Error(Code::InvalidArgument, "The read size and timeout must be positive"));
+  if (!channel || channel->closed)
+    co_return Result::Failure(Error(Code::Disconnected, "The Bluetooth channel is closed"));
+  if (std::exchange(channel->reading, true))
+    co_return Result::Failure(Error(Code::Busy, "A Bluetooth channel read is already pending"));
+  ChannelReadSlot slot{*channel, {}};
+  if (channel->received.empty() && !channel->eof) {
+    auto error = co_await AwaitCallback<std::optional<BluetoothError>>([&](auto done) -> Cancellation {
+      if (auto service = channel->service.lock()) {
+        channel->reader = done;
+        slot.deadline = service->tasks.Launch([done, timeout = options.timeout]() -> Task<void> {
+          co_await Delay(timeout);
+          done.Complete(Error(Code::TimedOut, "The Bluetooth channel read timed out"));
+        });
+      } else {
+        done.Complete(Error(Code::Disconnected, "The Bluetooth channel is closed"));
+      }
+      return {};
+    });
+    if (error)
+      co_return Result::Failure(std::move(*error));
+  }
+  if (channel->closed)
+    co_return Result::Failure(*channel->close_reason);
+  if (channel->received.empty())
+    co_return Result::Success(Bytes{});
+  // Advance the cursor only after the read Task resumes with the bytes still available.
+  const auto count = std::min(maximum, channel->received.size() - channel->offset);
+  auto begin = channel->received.begin() + channel->offset;
+  Bytes value(begin, begin + count);
+  channel->offset += count;
+  if (channel->offset == channel->received.size()) {
+    channel->received.clear();
+    if (auto service = channel->service.lock()) {
+      service->ChannelDrained(channel);
+      service->PumpChannel(channel);
+    }
+  }
+  co_return Result::Success(std::move(value));
+}
+
+Task<BluetoothResult<void>> WriteChannel(std::shared_ptr<Channel> channel, Bytes value, OperationOptions options) {
+  if (!channel || channel->closed || channel->output_ended)
+    co_return BluetoothResult<void>::Failure(Error(Code::Disconnected, "The Bluetooth channel is closed"));
+  co_return Take<void>(co_await Run(channel->service, Request{.operation = Operation::ChannelWrite, .link = channel->id,
+                                                             .value = std::move(value)}, options));
 }
 
 Task<BluetoothResult<GattSession>> Connect(std::weak_ptr<Service> weak, Device device, OperationOptions options,
@@ -1519,6 +1845,34 @@ void AdvertisingSession::Stop() noexcept {
   detail::ReleasePeripheral(session_, true);
 }
 
+BluetoothChannel::BluetoothChannel(std::shared_ptr<detail::Channel> channel) : channel_(std::move(channel)) {}
+
+BluetoothChannel::BluetoothChannel(BluetoothChannel&& other) noexcept = default;
+
+BluetoothChannel& BluetoothChannel::operator=(BluetoothChannel&& other) noexcept {
+  if (this != &other) {
+    detail::ReleaseChannel(channel_, false);
+    channel_ = std::move(other.channel_);
+  }
+  return *this;
+}
+
+BluetoothChannel::~BluetoothChannel() {
+  detail::ReleaseChannel(channel_, false);
+}
+
+Task<BluetoothResult<Bytes>> BluetoothChannel::ReadAsync(std::size_t maximum_bytes, OperationOptions options) {
+  return detail::ReadChannel(channel_, maximum_bytes, options);
+}
+
+Task<BluetoothResult<void>> BluetoothChannel::WriteAsync(Bytes value, OperationOptions options) {
+  return detail::WriteChannel(channel_, std::move(value), options);
+}
+
+void BluetoothChannel::Close() noexcept {
+  detail::ReleaseChannel(channel_, true);
+}
+
 Bluetooth::Bluetooth(std::shared_ptr<detail::Service> service) : service_(std::move(service)) {}
 
 BluetoothCapabilities Bluetooth::Capabilities() const {
@@ -1630,6 +1984,10 @@ Task<BluetoothResult<Device>> Bluetooth::RestoreDeviceAsync(std::string id, Oper
   return detail::Restore(service_, std::move(id), options);
 }
 
+Task<BluetoothResult<std::vector<Device>>> Bluetooth::ListPairedRfcommDevicesAsync(OperationOptions options) {
+  return detail::ListRfcomm(service_, options);
+}
+
 Task<BluetoothResult<BondState>> Bluetooth::GetBondStateAsync(Device device, OperationOptions options) {
   return detail::DeviceOperation<BondState>(service_, std::move(device), Operation::Bond, options);
 }
@@ -1648,6 +2006,22 @@ Task<BluetoothResult<GattConnection>> Bluetooth::ConnectWithRetryAsync(
     std::function<void(GattEvent)> on_event) {
   return detail::ConnectWithRetry(service_, std::move(device), options, std::move(restore_subscriptions),
                                   std::move(on_event));
+}
+
+Task<BluetoothResult<BluetoothChannel>> Bluetooth::ConnectRfcommAsync(
+    Device device, std::string service_uuid, OperationOptions options,
+    std::function<void(BluetoothChannelClosed)> on_closed) {
+  return detail::OpenChannel(service_, std::move(device),
+                             detail::Request{.operation = detail::Operation::OpenRfcomm,
+                                             .service_uuid = std::move(service_uuid)},
+                             options, std::move(on_closed));
+}
+
+Task<BluetoothResult<BluetoothChannel>> Bluetooth::ConnectLeL2capAsync(
+    Device device, std::uint16_t psm, OperationOptions options, std::function<void(BluetoothChannelClosed)> on_closed) {
+  return detail::OpenChannel(service_, std::move(device),
+                             detail::Request{.operation = detail::Operation::OpenL2cap, .psm = psm},
+                             options, std::move(on_closed));
 }
 
 Task<BluetoothResult<GattServerSession>> Bluetooth::OpenGattServerAsync(

@@ -1,6 +1,6 @@
 # HuxerUI Bluetooth Library Design
 
-**Status** — Foreground BLE client and peripheral operations implemented. Release support depends on platform device verification.
+**Status** — Foreground BLE client and peripheral operations, outbound RFCOMM, and outbound LE L2CAP implemented. Release support depends on platform device verification.
 
 `HuxerUI::Bluetooth` gives HuxerUI applications a typed C++ API for discovering nearby devices, acquiring access, and exchanging data. The first public release covers all six current HuxerUI targets. Android, iOS, macOS, Windows, and Linux provide foreground BLE discovery and a GATT client. Web provides browser-managed device selection and the same GATT client workflow on supported browser and operating system combinations.
 
@@ -15,7 +15,7 @@ The public contract describes operations and capabilities. Each backend reports 
 | Pairing | System-managed authentication for protected GATT operations, plus explicit pairing and bond queries on supported backends | Unpairing and platform-specific association management |
 | BLE client | Connect, discover, read, write, subscribe, disconnect, and recover a foreground connection with its subscriptions | Background communication and process restoration |
 | BLE peripheral | Foreground advertising and local GATT read, write with response, and notifications where supported | Additional advertising fields, custom descriptors, access protection, and peer-targeted updates |
-| Additional transports | The device model leaves room for transport-specific endpoints | Classic RFCOMM, applicable Apple accessory sessions, and LE L2CAP channels |
+| Bluetooth channels | Outbound RFCOMM by service UUID and LE L2CAP by PSM where supported | Incoming channels and applicable Apple accessory sessions |
 
 Qt Bluetooth provides separate interfaces for GATT and Bluetooth sockets. Capacitor BLE exposes continuous scanning and device selection as separate operations. FlutterBluePlus models service invalidation separately from connection state. These are useful boundaries for a library that spans native applications and browsers. [Qt Bluetooth](https://doc.qt.io/qt-6/qtbluetooth-index.html) · [Capacitor BLE](https://github.com/capacitor-community/bluetooth-le) · [FlutterBluePlus](https://pub.dev/packages/flutter_blue_plus)
 
@@ -25,10 +25,11 @@ Expose the library through `<huxerui/bluetooth.h>` in `huxerui::bluetooth`. Regi
 
 | Type | Responsibility | Operations and observations |
 | --- | --- | --- |
-| `Bluetooth` | Application-scoped service | Query capabilities and adapter status, start a scan, select or recover a device, query bond state, pair, and open a GATT session. |
+| `Bluetooth` | Application-scoped service | Query capabilities and adapter status, start a scan, select or recover a device, query bond state, pair, and open GATT sessions or Bluetooth channels. |
 | `ScanSession` | One foreground scan | Observe device updates and termination. Stop explicitly or release the handle. |
 | `Device` | Value identifying a device known to this backend | Carry an opaque identifier and available display information. A scan observation can also carry advertisement data. |
 | `GattSession` | One logical connection to a remote GATT server | Observe connection state and service invalidation, discover attributes, read, write, subscribe, and disconnect. |
+| `BluetoothChannel` | One logical RFCOMM or LE L2CAP byte stream | Read, write, and close, with optional terminal notification. |
 | `GattService`, `GattCharacteristic`, `GattDescriptor` | Discovered GATT objects | A service groups characteristics. Characteristics and descriptors carry a normalized UUID and an opaque session-scoped instance identity. |
 | `GattSubscription` | One consumer's subscription to a characteristic | Receive remote value updates. Stop explicitly or release the handle. |
 
@@ -762,9 +763,179 @@ Task<void> OpenPeripheral(std::shared_ptr<Bluetooth> bluetooth, std::shared_ptr<
 
 When the application changes the value, call `co_await model->server->NotifyAsync(service_uuid, value_uuid, *model->value)` and handle the result. The Preview exposes controls to open the server, advertise its service, and notify subscribed peers. Each handle has its own stop action. The existing client can scan for `service_uuid`, then discover, read, write, and subscribe through its `GattSession`.
 
-### Classic Bluetooth and other transports
+### RFCOMM and LE L2CAP
 
-RFCOMM exposes classic service discovery by UUID, an outbound byte stream, and explicit close. Listener and inbound connection support can be added where the host provides them. Classic serial printers, modules, and scanners are candidate clients. LE L2CAP uses a channel endpoint and separate capability. Apple External Accessory uses the accessory protocol declared by the application. Device profiles such as audio, keyboard input, and MIDI belong to the relevant OS services or application libraries. [Qt Bluetooth socket](https://doc.qt.io/qt-6/qbluetoothsocket.html) · [BlueZ profile API](https://bluez.readthedocs.io/en/latest/profile-api/) · [Core Bluetooth L2CAP](https://developer.apple.com/documentation/corebluetooth/cbperipheral/openl2capchannel(_:))
+**Status** — Implemented API
+
+Open RFCOMM by Classic service UUID and LE L2CAP by the peer's Protocol/Service Multiplexer (PSM). Both operations return a move-only `BluetoothChannel` with the same byte-stream contract. Reuse `Device`, `Bytes`, `Task`, `BluetoothResult`, `OperationOptions`, and `TaskHandle` cancellation. Read and write follow the SDK's `AsyncInputStream` and `AsyncOutputStream` conventions for bounded reads, EOF, and complete writes. The channel owns both directions and retains Bluetooth errors and operation deadlines.
+
+The API covers outbound channels. Classic discovery starts with system-paired candidates. A device protocol can use the existing BLE scan, device recovery, and GATT APIs to find its LE peer and obtain the endpoint.
+
+#### Public declarations
+
+The channel operations add the following fields to `BluetoothCapabilities`. Each field reports an independently available operation on the current backend and adapter. Operation results account for peer support, access, adapter state, and resource limits.
+
+```cpp
+/// Supports listing system-paired Classic candidates for RFCOMM.
+bool can_list_paired_rfcomm_devices = false;
+
+/// Supports opening a Classic RFCOMM channel by service UUID.
+bool can_connect_rfcomm = false;
+
+/// Supports opening an LE L2CAP credit-based channel by PSM.
+bool can_connect_le_l2cap = false;
+```
+
+```cpp
+/// @brief Terminal event for an acquired Bluetooth channel.
+/// At orderly peer EOF, delivery waits until all buffered bytes have reached a reader.
+struct BluetoothChannelClosed {
+  /// Empty after an explicit close or observed orderly peer EOF.
+  std::optional<BluetoothError> error;
+};
+
+/// @brief Unique owner of a foreground Bluetooth byte stream.
+/// Use and destroy the channel on the owning application thread.
+class BluetoothChannel final {
+public:
+  BluetoothChannel(BluetoothChannel&& other) noexcept;
+
+  BluetoothChannel& operator=(BluetoothChannel&& other) noexcept;
+
+  ~BluetoothChannel();
+
+  /// @brief Reads the next available chunk in stream order.
+  /// @param maximum_bytes Positive upper bound for the returned chunk.
+  /// @param options Deadline for the read.
+  /// @return Owned bytes, an empty success after buffered data drains at orderly EOF, or an operation error.
+  Task<BluetoothResult<Bytes>> ReadAsync(std::size_t maximum_bytes, OperationOptions options = {});
+
+  /// @brief Submits the supplied bytes in stream order.
+  /// @param value Owned bytes retained for the duration of the operation.
+  /// @param options Deadline for accepting the complete value.
+  /// @return Success after platform acceptance of all bytes, or an operation error.
+  Task<BluetoothResult<void>> WriteAsync(Bytes value, OperationOptions options = {});
+
+  /// @brief Stops both directions and retires pending I/O.
+  /// Close is idempotent and discards unread bytes. Retain the handle to receive the terminal event.
+  void Close() noexcept;
+};
+
+// Members of Bluetooth.
+/// @brief Lists paired devices that are candidates for Classic RFCOMM.
+/// @param options Deadline for reading the system's paired-device records.
+/// @return Backend-scoped devices, possibly an empty list, or an operation error.
+Task<BluetoothResult<std::vector<Device>>> ListPairedRfcommDevicesAsync(OperationOptions options = {});
+
+/// @brief Resolves a Classic service and opens its RFCOMM channel.
+/// @param device Device with a Classic identity from this application backend.
+/// @param service_uuid Service class UUID in the same formats as ScanOptions.
+/// @param options Deadline covering service resolution and channel open.
+/// @param on_closed Optional terminal callback for the acquired channel.
+/// @return An open channel or an operation error. A conflicting open can return Busy during platform cleanup.
+Task<BluetoothResult<BluetoothChannel>> ConnectRfcommAsync(
+    Device device, std::string service_uuid, OperationOptions options = {},
+    std::function<void(BluetoothChannelClosed)> on_closed = {});
+
+/// @brief Opens an LE L2CAP credit-based channel.
+/// @param device LE peer recognized by this application backend.
+/// @param psm Current endpoint from the peer's device protocol.
+/// @param options Deadline covering link acquisition and channel open.
+/// @param on_closed Optional terminal callback for the acquired channel.
+/// @return An open channel or an operation error. A conflicting open can return Busy during platform cleanup.
+Task<BluetoothResult<BluetoothChannel>> ConnectLeL2capAsync(
+    Device device, std::uint16_t psm, OperationOptions options = {},
+    std::function<void(BluetoothChannelClosed)> on_closed = {});
+```
+
+#### Device and endpoint resolution
+
+`ListPairedRfcommDevicesAsync()` reads system-paired Classic candidates from the selected adapter where the platform exposes adapter scope. It skips known LE-only devices and can include candidates whose transport is unknown. The list only describes system records. Resolve the service on the selected peer during `ConnectRfcommAsync()`, using the platform SDP path. Where the backend finds multiple distinct matches without a platform selection, return `Unsupported` for that request. A valid device or endpoint that is no longer available returns `DeviceUnavailable`.
+
+Keep transport-specific identity data inside `Device`. Classic and LE identities can differ for the same physical peer. Extend `RestoreDeviceAsync()` to look up saved Classic identifiers through the backend's paired-device records. RFCOMM preferences store `Device::Id()` and the service UUID. Malformed UUIDs, out-of-range PSMs, and devices from a different application backend return `InvalidArgument`.
+
+LE credit-based connections use the LE SPSM range `0x0001` through `0x00FF`. The portable application range is `0x0080` through `0x00FF`. A valid fixed PSM can return `Unsupported` where the platform only exposes dynamic endpoints. Read a dynamic PSM from the peer's service before each connection, including reconnects. Use `GattSession::ReadAsync()` when the device profile publishes the PSM as a characteristic. The L2CAP open takes a `Device` and acquires or reuses the LE link. GATT attribute handles stay scoped to their discovery snapshot. [Bluetooth Core L2CAP specification](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-62/out/en/host/logical-link-control-and-adaptation-protocol-specification.html)
+
+Applications request the applicable access before connecting. The platform can require pairing or consent during service access. Use the protected connection variant where the platform provides that choice. Preserve authorization and security failures through existing Bluetooth errors. Protection levels follow the platform and peer.
+
+#### Channel I/O and lifetime
+
+| Operation | Contract |
+| --- | --- |
+| `ReadAsync(maximum_bytes)` | Wait for available data, then return up to the requested size. Empty success reports orderly EOF. A zero size returns `InvalidArgument`. Applications frame messages on top of the stream. |
+| `WriteAsync(value)` | Success means the platform accepted every byte in order. An empty value on an open channel succeeds without sending data. A failure may leave a written prefix. The device protocol defines acknowledgement and retry. |
+| `Close()` | Retire the logical channel immediately, discard unread data, and start platform cleanup. Pending operations on a live caller receive `Canceled`. Later I/O returns `Disconnected`. Use application acknowledgements when delivery must be confirmed before closing. |
+
+Tasks are lazy. Start the deadline and reserve the operation slot when the Task runs. Admit one read and one write concurrently per channel. A second operation in the same direction returns `Busy`. Preserve byte order through partial platform reads and writes. For an LE L2CAP backend using packet sockets, receive each SDU in full and retain bytes beyond the caller's read size. Segment writes to the platform's transmit limits. Bound buffering and apply platform flow control. If a push-only transport exhausts the receive buffer, close with a diagnostic `PlatformFailure`.
+
+Cancellation through `TaskHandle` or its scope detaches the caller's continuation. A deadline returns `TimedOut` to a live caller. A canceled or timed-out read consumes no bytes before handoff. Keep one platform receive path and retain bytes until a read hands them to a live caller. An interrupted write can leave the channel usable when the backend can establish that zero bytes were submitted. Otherwise retire the channel to protect byte-stream integrity.
+
+On an observable orderly peer EOF, fail new writes and any write still awaiting platform acceptance with `Disconnected`. A platform can report the output stream ending before input EOF. In that case, reads continue after writes end. Reads return buffered bytes and then return empty success at input EOF. Queue `on_closed` after the last buffered bytes have reached a live reader, or immediately if no bytes are buffered. The callback can therefore remain pending while the application has unread bytes. An undifferentiated link loss reports `Disconnected`. Explicit close and destruction retire both directions immediately and discard unread bytes. Destruction suppresses pending terminal delivery. An acquired channel reports at most one terminal event on the owning application thread.
+
+Start listing and connecting while the application is active. Inactive transitions allow admitted work to continue. Entering the background cancels pending opens and retires acquired channels with `Canceled`. Adapter or permission loss retires affected channels using the reported Bluetooth error.
+
+Canceling or timing out an open retires the caller's attempt and starts platform cleanup. Close any channel returned by a late completion for that attempt. A conflicting open returns `Busy` until the previous open completes, its cancellation is confirmed, or the backend can safely distinguish its callbacks from the new attempt. Keep an active GATT session connected while resolving an outstanding L2CAP open.
+
+The backend tracks physical link use per peer. Each GATT session and LE L2CAP channel holds a separate claim. A pending open holds its claim while it needs the link. Closing a GATT session or L2CAP channel releases its own operations, handles, and claim. If the backend established the link, it can disconnect it after the last claim is released and any other affected transport is done. Release a borrowed link without requesting a device-wide disconnect. Actual link loss is reported to all affected owners. For example, an application can read the PSM over GATT, open the L2CAP channel, and then disconnect the GATT session while continuing L2CAP I/O.
+
+#### Platform mapping
+
+| Target | RFCOMM | LE L2CAP |
+| --- | --- | --- |
+| Android | List candidates with `getBondedDevices()`, create the RFCOMM socket with `createRfcommSocketToServiceRecord()`, and connect on a worker. Keep the socket to interrupt a pending blocking connect or write. | Use `createL2capChannel()` on API 29 and later for dynamic PSMs. Reuse the `BluetoothSocket` stream path. The app requests `BLUETOOTH_CONNECT` where required. [Android device sockets](https://developer.android.com/reference/android/bluetooth/BluetoothDevice#createL2capChannel(int)) · [Android socket lifetime](https://developer.android.com/reference/android/bluetooth/BluetoothSocket) |
+| iOS | Report `Unsupported` for generic RFCOMM. Core Bluetooth Classic exposes a GATT path. External Accessory uses an accessory protocol. | Open with `CBPeripheral::openL2CAPChannel` and use `CBL2CAPChannel` streams. Share the Core Bluetooth peer and delegate with GATT and keep independent logical lifetimes. [Core Bluetooth Classic](https://developer.apple.com/videos/play/wwdc2019/901/) · [L2CAP streams](https://developer.apple.com/documentation/corebluetooth/cbl2capchannel) |
+| macOS | Use `IOBluetoothDevice` paired-device records, an SDP query, and `openRFCOMMChannelAsync`. Honor the sandbox Bluetooth entitlement where applicable. | Implement LE link acquisition and `CBL2CAPChannel` in the macOS backend separately from iOS. [IOBluetooth device API](https://developer.apple.com/documentation/iobluetooth/iobluetoothdevice) · [Core Bluetooth L2CAP](https://developer.apple.com/documentation/corebluetooth/cbl2capchannel) |
+| Windows | Enumerate paired Classic devices and resolve the service with WinRT RFCOMM. Open a `StreamSocket` for the resolved service and honor platform consent and packaging requirements. | Report `Unsupported` for LE L2CAP in this backend. The Windows 7 compatibility build reports both transports as unsupported. [Windows RFCOMM](https://learn.microsoft.com/en-us/windows/apps/develop/devices-sensors/send-or-receive-files-with-rfcomm) · [WinRT service resolution](https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.rfcomm.rfcommdeviceservice) |
+| Linux | Use paired BlueZ device records and a client profile for the UUID. Open only after receiving the matching socket through `Profile1.NewConnection`. A profile registration conflict returns `Busy`. | Use an `AF_BLUETOOTH` LE L2CAP socket on the selected adapter and the peer's known address type. Bridge complete SDUs to the shared stream using negotiated socket limits. [BlueZ profile API](https://bluez.readthedocs.io/en/latest/profile-api/) · [BlueZ socket and MTU handling](https://github.com/bluez/bluez/blob/master/tools/l2cap-tester.c) |
+| Web | The Web Bluetooth backend reports `Unsupported`. Chromium Web Serial can access certain RFCOMM services through its own port chooser and grant. | The Web Bluetooth backend reports `Unsupported` for LE L2CAP. [Web Bluetooth](https://developer.chrome.com/docs/capabilities/bluetooth) · [Chromium Web Serial over Bluetooth](https://developer.chrome.com/blog/serial-over-bluetooth) |
+
+Build the Linux backend with the BlueZ development headers. The macOS RFCOMM backend admits one active channel or pending open per Classic peer to preserve exclusive delegate ownership.
+
+Serialize pending Core Bluetooth channel opens per peripheral. A failed delegate callback can omit the channel object. After cancellation or timeout, the slot remains occupied until the delegate completion arrives or link or manager teardown makes callbacks from the previous open safe to ignore. On Linux, disable profile auto-connect and use `Device1.ConnectProfile()` for the selected UUID. Correlate the resulting file descriptor by client profile and device path, and close unmatched descriptors.
+
+#### Application example
+
+Both connect operations use the same I/O function. This example writes an application payload and consumes one available chunk. An application parser can keep reading until it has a complete message.
+
+```cpp
+Task<void> ExchangeChunk(BluetoothChannel channel, Bytes payload) {
+  auto written = co_await channel.WriteAsync(std::move(payload));
+  if (!written.Succeeded()) {
+    ShowBluetoothError(written.Error());
+    co_return;
+  }
+
+  auto received = co_await channel.ReadAsync(1024);
+  if (!received.Succeeded()) {
+    ShowBluetoothError(received.Error());
+  } else if (!received.Value().empty()) {
+    ConsumeChunk(std::move(received).Value());
+  }
+  channel.Close();
+}
+
+Task<void> OpenRfcomm(Bluetooth& bluetooth, Device selected, std::string service_uuid, Bytes payload) {
+  auto opened = co_await bluetooth.ConnectRfcommAsync(std::move(selected), std::move(service_uuid));
+  if (opened.Succeeded()) {
+    co_await ExchangeChunk(std::move(opened).Value(), std::move(payload));
+  } else {
+    ShowBluetoothError(opened.Error());
+  }
+}
+
+Task<void> OpenLeChannel(Bluetooth& bluetooth, Device peer, std::uint16_t current_psm, Bytes payload) {
+  auto opened = co_await bluetooth.ConnectLeL2capAsync(std::move(peer), current_psm);
+  if (opened.Succeeded()) {
+    co_await ExchangeChunk(std::move(opened).Value(), std::move(payload));
+  } else {
+    ShowBluetoothError(opened.Error());
+  }
+}
+```
+
+### Other transports
+
+Apple External Accessory uses the accessory protocol declared by the application. Device profiles such as audio, keyboard input, and MIDI belong to the relevant OS services or application libraries. [External Accessory](https://developer.apple.com/documentation/externalaccessory/)
 
 ### Background communication and process restoration
 

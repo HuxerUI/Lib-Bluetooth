@@ -27,6 +27,7 @@ namespace huxerui::bluetooth {
 namespace detail {
 struct Access;
 struct Attribute;
+struct Channel;
 struct DeviceData;
 struct PeripheralSession;
 struct Scan;
@@ -45,7 +46,7 @@ enum class BluetoothErrorCode {
   AdapterOff,
   /// The application or device grant does not allow the operation.
   PermissionDenied,
-  /// The remote attribute requires authentication, authorization, or encryption.
+  /// The remote endpoint requires authentication, authorization, or encryption.
   AuthenticationRequired,
   /// The attempt to authenticate or establish a bond failed.
   AuthenticationFailed,
@@ -57,7 +58,7 @@ enum class BluetoothErrorCode {
   Busy,
   /// The backend does not recognize the device or cannot currently reach it.
   DeviceUnavailable,
-  /// The logical GATT session is closed or the connection was lost.
+  /// The logical session or channel is closed, or the connection was lost.
   Disconnected,
   /// The attribute belongs to a different session or a retired discovery snapshot.
   StaleAttribute,
@@ -146,6 +147,12 @@ struct BluetoothCapabilities {
   bool can_use_gatt_server = false;
   /// Supports BLE advertising independently of an open local GATT server.
   bool can_advertise_standalone = false;
+  /// Supports listing system-paired Classic candidates for RFCOMM.
+  bool can_list_paired_rfcomm_devices = false;
+  /// Supports opening a Classic RFCOMM channel by service UUID.
+  bool can_connect_rfcomm = false;
+  /// Supports opening an LE L2CAP credit-based channel by PSM.
+  bool can_connect_le_l2cap = false;
 };
 
 /// @brief A discovered, selected, or restored device owned by the original application backend.
@@ -577,6 +584,55 @@ private:
   friend struct detail::Access;
 };
 
+/// @brief Terminal event for an acquired Bluetooth channel.
+/// At orderly peer EOF, delivery waits until all buffered bytes have reached a reader.
+struct BluetoothChannelClosed {
+  /// Empty after an explicit close or observed orderly peer EOF.
+  std::optional<BluetoothError> error;
+};
+
+/// @brief Unique owner of a foreground Bluetooth byte stream.
+/// Use and destroy the channel on the owning application thread.
+/// Each Task starts when it runs. One read and one write can run concurrently.
+class BluetoothChannel final {
+public:
+  /// @brief Transfers ownership of the channel and its pending operations.
+  /// @param other Channel to move from.
+  BluetoothChannel(BluetoothChannel&& other) noexcept;
+
+  /// @brief Closes the current channel and takes ownership from other.
+  /// @param other Channel to move from.
+  /// @return This channel owner.
+  BluetoothChannel& operator=(BluetoothChannel&& other) noexcept;
+
+  /// @brief Closes the channel and suppresses pending terminal notification.
+  ~BluetoothChannel();
+
+  /// @brief Reads the next available chunk in stream order.
+  /// A canceled or timed-out read leaves bytes available to the next read.
+  /// @param maximum_bytes Positive upper bound for the returned chunk.
+  /// @param options Deadline for the read.
+  /// @return Owned bytes, an empty success after buffered data drains at orderly EOF, or an operation error.
+  Task<BluetoothResult<Bytes>> ReadAsync(std::size_t maximum_bytes, OperationOptions options = {});
+
+  /// @brief Submits the supplied bytes in stream order.
+  /// The channel closes if an interrupted write may have submitted part of the value.
+  /// @param value Owned bytes retained for the duration of the operation.
+  /// @param options Deadline for accepting the complete value.
+  /// @return Success after platform acceptance of all bytes, or an operation error.
+  Task<BluetoothResult<void>> WriteAsync(Bytes value, OperationOptions options = {});
+
+  /// @brief Stops both directions and retires pending I/O.
+  /// Close is idempotent and discards unread bytes. Retain the handle to receive the terminal event.
+  void Close() noexcept;
+
+private:
+  explicit BluetoothChannel(std::shared_ptr<detail::Channel> channel);
+
+  std::shared_ptr<detail::Channel> channel_;
+  friend struct detail::Access;
+};
+
 /// @brief Application-scoped entry point for nearby Bluetooth devices.
 /// Call its methods on the owning application thread, and launch operations from an event or committed lifecycle.
 /// @code{.cpp}
@@ -634,6 +690,11 @@ public:
   /// @param options Deadline for recovery.
   /// @return The device when the backend still recognizes it, or an operation error.
   Task<BluetoothResult<Device>> RestoreDeviceAsync(std::string id, OperationOptions options = {});
+
+  /// @brief Lists paired devices that are candidates for Classic RFCOMM.
+  /// @param options Deadline for reading the system's paired-device records.
+  /// @return Backend-scoped devices, possibly an empty list, or an operation error.
+  Task<BluetoothResult<std::vector<Device>>> ListPairedRfcommDevicesAsync(OperationOptions options = {});
 
   /// @brief Queries an observable system bond.
   /// @param device Device from this application service.
@@ -704,6 +765,38 @@ public:
   Task<BluetoothResult<GattConnection>> ConnectWithRetryAsync(
       Device device, ReconnectOptions options = {}, RestoreSubscriptions restore_subscriptions = {},
       std::function<void(GattEvent)> on_event = {});
+
+  /// @brief Resolves a Classic service and opens its RFCOMM channel.
+  /// Launch while the application is active. ListPairedRfcommDevicesAsync() provides candidate devices.
+  /// @param device Device with a Classic identity from this application backend.
+  /// @param service_uuid Service class UUID in the same formats as ScanOptions.
+  /// @param options Deadline covering service resolution and channel open.
+  /// @param on_closed Optional terminal callback for the acquired channel.
+  /// @return An open channel or an operation error. A conflicting open can return Busy during platform cleanup.
+  Task<BluetoothResult<BluetoothChannel>> ConnectRfcommAsync(
+      Device device, std::string service_uuid, OperationOptions options = {},
+      std::function<void(BluetoothChannelClosed)> on_closed = {});
+
+  /// @brief Opens an LE L2CAP credit-based channel.
+  /// Launch while the application is active. Resolve the endpoint again before reconnecting to a dynamic PSM.
+  /// @param device LE peer recognized by this application backend.
+  /// @param psm Current endpoint from the peer's device protocol.
+  /// @param options Deadline covering link acquisition and channel open.
+  /// @param on_closed Optional terminal callback for the acquired channel.
+  /// @return An open channel or an operation error. A conflicting open can return Busy during platform cleanup.
+  /// @code{.cpp}
+  /// auto opened = co_await bluetooth->ConnectLeL2capAsync(device, current_psm);
+  /// if (opened.Succeeded()) {
+  ///   auto channel = std::move(opened).Value();
+  ///   auto received = co_await channel.ReadAsync(1024);
+  ///   if (received.Succeeded() && !received.Value().empty())
+  ///     ConsumeChunk(std::move(received).Value());
+  ///   channel.Close();
+  /// }
+  /// @endcode
+  Task<BluetoothResult<BluetoothChannel>> ConnectLeL2capAsync(
+      Device device, std::uint16_t psm, OperationOptions options = {},
+      std::function<void(BluetoothChannelClosed)> on_closed = {});
 
   /// @brief Opens a local GATT server with the supplied primary services and handlers.
   /// Launch while the application is active. Request handlers run synchronously on the owning application thread.

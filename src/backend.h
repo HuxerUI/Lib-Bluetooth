@@ -44,7 +44,14 @@ struct Discovery {
 };
 
 enum class Operation { Scan, Select, Restore, Bond, Pair, Connect, Discover, Read, Write, Notify,
-                       Advertise, OpenServer, SendNotification };
+                       Advertise, OpenServer, SendNotification,
+                       ListRfcomm, OpenRfcomm, OpenL2cap, ChannelRead, ChannelWrite };
+
+inline bool IsChannelOpen(Operation operation) {
+  return operation == Operation::OpenRfcomm || operation == Operation::OpenL2cap;
+}
+
+inline constexpr std::size_t channel_read_size = 65535;
 
 inline bool IsPeripheralOperation(Operation operation) {
   return operation == Operation::Advertise || operation == Operation::OpenServer ||
@@ -79,9 +86,12 @@ struct Request {
   Token server = 0;
   AdvertisingOptions advertisement;
   std::vector<ServerService> local_services;
+  std::string service_uuid;
+  std::uint16_t psm = 0;
 };
 
-using ReplyValue = std::variant<std::monostate, FoundDevice, BondState, WriteLimits, Discovery, Bytes>;
+using ReplyValue = std::variant<std::monostate, FoundDevice, BondState, WriteLimits, Discovery, Bytes,
+                                std::vector<FoundDevice>>;
 using Reply = BluetoothResult<ReplyValue>;
 using Completion = std::function<void(Reply)>;
 using Cancellation = std::function<void()>;
@@ -99,6 +109,16 @@ struct ScanFailure {
 
 struct LinkLost {
   Token link;
+  BluetoothError error;
+};
+
+struct ChannelStreamEnded {
+  Token channel;
+  bool input;
+};
+
+struct ChannelLost {
+  Token channel;
   BluetoothError error;
 };
 
@@ -151,7 +171,7 @@ struct PeripheralFailure {
 
 using BackendEvent =
     std::variant<AdapterStatus, ScanReport, ScanFailure, LinkLost, ServicesChanged, LimitsChanged, ValueChanged,
-                 ServerRequest, ServerSubscription, PeripheralFailure>;
+                 ServerRequest, ServerSubscription, PeripheralFailure, ChannelStreamEnded, ChannelLost>;
 
 class Backend {
 public:
@@ -161,11 +181,15 @@ public:
 
   virtual BluetoothCapabilities PeripheralCapabilities() const { return {}; }
 
+  virtual BluetoothCapabilities ChannelCapabilities() const;
+
   virtual Cancellation Invoke(Request request, Completion completion) = 0;
 
   virtual void StopScan(Token scan) = 0;
 
   virtual void Disconnect(Token link) = 0;
+
+  virtual void CloseChannel(Token) {}
 
   virtual void StopAdvertising(Token) {}
 

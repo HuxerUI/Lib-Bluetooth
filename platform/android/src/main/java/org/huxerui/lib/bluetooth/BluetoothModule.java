@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.BluetoothSocket;
 import android.bluetooth.BluetoothStatusCodes;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
@@ -31,14 +32,19 @@ import org.huxerui.HuxerUIPlatformChannel;
 import org.huxerui.HuxerUIPlatformModule;
 import org.huxerui.PlatformPayload;
 
+import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @SuppressWarnings("deprecation")
 public final class BluetoothModule implements HuxerUIPlatformModule {
@@ -54,6 +60,8 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
     private final Map<String, BluetoothDevice> devices = new HashMap<>();
     private final Map<String, HuxerUIPlatformChannel.Result> pairing = new HashMap<>();
     private final Map<Long, Link> links = new HashMap<>();
+    private final Map<Long, SocketChannel> channels = new HashMap<>();
+    private final ExecutorService socketWorkers = Executors.newCachedThreadPool();
     private BluetoothLeScanner scanner;
     private ScanCallback scanCallback;
     private long scanToken;
@@ -108,7 +116,8 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
     };
 
     private int status() {
-        if (adapter == null || !context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
+        if (adapter == null || (!hasFeature(PackageManager.FEATURE_BLUETOOTH)
+                && !hasFeature(PackageManager.FEATURE_BLUETOOTH_LE))) {
             return 1;
         }
         if (Build.VERSION.SDK_INT >= 31
@@ -120,9 +129,16 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         return state == BluetoothAdapter.STATE_ON ? 3 : state == BluetoothAdapter.STATE_OFF ? 2 : 0;
     }
 
+    private boolean hasFeature(String feature) {
+        return context.getPackageManager().hasSystemFeature(feature);
+    }
+
     private PlatformPayload statusPayload() {
         int current = status();
-        return object("status", number(current), "peripheral", peripheral.capabilities(current != 1));
+        return object("status", number(current), "peripheral", peripheral.capabilities(current != 1),
+                "classic", PlatformPayload.booleanValue(adapter != null && hasFeature(PackageManager.FEATURE_BLUETOOTH)),
+                "l2cap", PlatformPayload.booleanValue(adapter != null && Build.VERSION.SDK_INT >= 29
+                        && hasFeature(PackageManager.FEATURE_BLUETOOTH_LE)));
     }
 
     @Override
@@ -149,6 +165,10 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
                     stopScan(args.requireInt64());
                     result.complete(EMPTY);
                     return null;
+                case "close_channel":
+                    closeChannel(args.requireInt64());
+                    result.complete(EMPTY);
+                    return null;
                 case "disconnect":
                     closeLink(args.requireInt64());
                     result.complete(EMPTY);
@@ -158,7 +178,8 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
             }
 
             int current = status();
-            if (current == 1 || current == 2 && !method.equals("restore") && !method.equals("bond")) {
+            if (current == 1 || (current == 2 && !method.equals("restore")
+                    && !method.equals("bond") && !method.equals("list_rfcomm"))) {
                 fail(result, current == 1 ? "unavailable" : "off", "Android Bluetooth adapter is unavailable", current);
                 return null;
             }
@@ -177,6 +198,16 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
                 case "pair":
                 case "connect":
                     return deviceOperation(method, args, result);
+                case "list_rfcomm":
+                    listRfcomm(result);
+                    return null;
+                case "open_rfcomm":
+                case "open_l2cap":
+                    return openChannel(method, args, result);
+                case "channel_read":
+                case "channel_write":
+                    socketIo(method, args, result);
+                    return null;
                 case "discover":
                 case "read":
                 case "write":
@@ -398,8 +429,145 @@ public final class BluetoothModule implements HuxerUIPlatformModule {
         for (long id : new ArrayList<>(links.keySet())) {
             closeLink(id);
         }
+        for (long id : new ArrayList<>(channels.keySet())) {
+            closeChannel(id);
+        }
+        socketWorkers.shutdownNow();
         pairing.clear();
         devices.clear();
+    }
+
+    private void listRfcomm(HuxerUIPlatformChannel.Result result) {
+        List<PlatformPayload> candidates = new ArrayList<>();
+        for (BluetoothDevice device : adapter.getBondedDevices()) {
+            if (device.getType() != BluetoothDevice.DEVICE_TYPE_LE) {
+                devices.put(device.getAddress(), device);
+                candidates.add(deviceInfo(device));
+            }
+        }
+        result.complete(PlatformPayload.list(candidates));
+    }
+
+    private HuxerUIPlatformChannel.Cancellation openChannel(
+            String method, PlatformPayload args, HuxerUIPlatformChannel.Result result) {
+        String address = args.requireField("device").requireString();
+        BluetoothDevice device = devices.get(address);
+        if (device == null) {
+            fail(result, "device", "Android no longer recognizes this Bluetooth device", 0);
+            return null;
+        }
+        boolean l2cap = method.equals("open_l2cap");
+        int psm = (int) id(args, "psm");
+        UUID service = l2cap ? null : UUID.fromString(args.requireField("uuid").requireString());
+        if (l2cap && (Build.VERSION.SDK_INT < 29 || psm < 0x80)) {
+            fail(result, "unsupported", "Android requires a dynamic PSM and API level 29 for LE L2CAP", 0);
+            return null;
+        }
+        int deviceType = device.getType();
+        if ((l2cap && deviceType == BluetoothDevice.DEVICE_TYPE_CLASSIC)
+                || (!l2cap && deviceType == BluetoothDevice.DEVICE_TYPE_LE)) {
+            fail(result, "unsupported", "The peer does not expose this Bluetooth transport", 0);
+            return null;
+        }
+        for (SocketChannel existing : channels.values()) {
+            if (!existing.connected && existing.device.equals(device)
+                    && existing.psm == psm && Objects.equals(existing.service, service)) {
+                fail(result, "busy", "A Bluetooth socket is already connecting to this endpoint", 0);
+                return null;
+            }
+        }
+        long token = id(args, "link");
+        try {
+            BluetoothSocket socket = l2cap ? device.createL2capChannel(psm)
+                    : device.createRfcommSocketToServiceRecord(service);
+            SocketChannel channel = new SocketChannel(socket, device, psm, service);
+            channels.put(token, channel);
+            socketWorkers.execute(() -> {
+                String failure = null;
+                try {
+                    socket.connect();
+                } catch (SecurityException error) {
+                    failure = "permission";
+                } catch (IOException | RuntimeException error) {
+                    failure = "device";
+                }
+                String reason = failure;
+                handler.post(() -> {
+                    if (channels.get(token) != channel) {
+                        return;
+                    }
+                    if (reason != null) {
+                        closeChannel(token);
+                        fail(result, reason, "Android could not connect the Bluetooth socket", 0);
+                    } else {
+                        channel.connected = true;
+                        result.complete(EMPTY);
+                    }
+                });
+            });
+            return () -> handler.post(() -> closeChannel(token));
+        } catch (IOException error) {
+            fail(result, "device", "Android could not create the Bluetooth socket", 0);
+            return null;
+        }
+    }
+
+    private void socketIo(String method, PlatformPayload args, HuxerUIPlatformChannel.Result result) {
+        long token = id(args, "link");
+        SocketChannel channel = channels.get(token);
+        if (channel == null || !channel.connected) {
+            fail(result, "disconnected", "The Bluetooth socket is closed", 0);
+            return;
+        }
+        boolean read = method.equals("channel_read");
+        byte[] data = read ? new byte[65535] : args.requireField("value").requireBytes();
+        socketWorkers.execute(() -> {
+            try {
+                PlatformPayload value = EMPTY;
+                if (read) {
+                    int count = channel.socket.getInputStream().read(data);
+                    value = PlatformPayload.bytes(Arrays.copyOf(data, Math.max(count, 0)));
+                } else {
+                    channel.socket.getOutputStream().write(data);
+                }
+                PlatformPayload received = value;
+                handler.post(() -> {
+                    if (channels.get(token) == channel) {
+                        result.complete(received);
+                    }
+                });
+            } catch (SecurityException error) {
+                handler.post(() -> fail(result, "permission", "Android Bluetooth permission was lost", 0));
+            } catch (IOException | RuntimeException error) {
+                handler.post(() -> fail(result, "disconnected", "The Android Bluetooth socket closed during I/O", 0));
+            }
+        });
+    }
+
+    private void closeChannel(long id) {
+        SocketChannel channel = channels.remove(id);
+        if (channel != null) {
+            try {
+                channel.socket.close();
+            } catch (IOException ignored) {
+                // The channel is already retired from the module.
+            }
+        }
+    }
+
+    private static final class SocketChannel {
+        final BluetoothSocket socket;
+        final BluetoothDevice device;
+        final int psm;
+        final UUID service;
+        boolean connected;
+
+        SocketChannel(BluetoothSocket socket, BluetoothDevice device, int psm, UUID service) {
+            this.socket = socket;
+            this.device = device;
+            this.psm = psm;
+            this.service = service;
+        }
     }
 
     private final class Link extends BluetoothGattCallback {
