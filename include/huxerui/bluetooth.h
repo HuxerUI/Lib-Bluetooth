@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -420,6 +421,46 @@ private:
   friend struct detail::Access;
 };
 
+/// @brief Options for a foreground connection and subscription recovery task.
+struct ReconnectOptions {
+  /// Maximum number of attempts, including the first attempt. Must be positive.
+  std::size_t max_attempts = 3;
+
+  /// Positive delay before the first retry. Subsequent retries double the delay up to max_retry_delay.
+  std::chrono::milliseconds initial_retry_delay{250};
+
+  /// Maximum retry delay. Must be at least initial_retry_delay.
+  std::chrono::milliseconds max_retry_delay{2000};
+
+  /// Per-operation deadline for connecting and discovering services.
+  OperationOptions operation;
+};
+
+/// @brief An acquired session and its discovered services and restored subscriptions.
+///
+/// Keep this value while using the session and subscriptions. Destroying it releases the subscriptions
+/// before closing the session.
+struct GattConnection {
+  /// Connected session that owns the GATT operations.
+  GattSession session;
+
+  /// Services discovered for this session during setup.
+  std::vector<GattService> services;
+
+  /// Subscription owners returned by the application's setup callback.
+  std::vector<GattSubscription> subscriptions;
+};
+
+/// @brief Application setup invoked with a fresh session and its discovered services.
+///
+/// The returned Task runs in the application task scope and borrows the session and services until completion.
+/// Call SubscribeAsync() with attributes from the provided snapshot and return the subscription owners.
+/// Leave ownership of the session
+/// and snapshot with the connection helper. Returning an error discards the attempt and releases any
+/// subscriptions acquired during setup.
+using RestoreSubscriptions = std::function<Task<BluetoothResult<std::vector<GattSubscription>>>(
+    GattSession&, std::span<const GattService>)>;
+
 /// @brief Application-scoped entry point for nearby Bluetooth devices.
 /// Call its methods on the owning application thread, and launch operations from an event or committed lifecycle.
 /// @code{.cpp}
@@ -523,6 +564,30 @@ public:
   /// @endcode
   Task<BluetoothResult<GattSession>> ConnectAsync(Device device, OperationOptions options = {},
                                                  std::function<void(GattEvent)> on_event = {});
+
+  /// @brief Connects, discovers services, and restores application subscriptions with bounded foreground retries.
+  ///
+  /// Launch while the application is active. Entering the background retires the pending Task with Canceled.
+  /// Cancel the caller's Task to stop a pending recovery. Launch again from an unexpected GattDisconnected
+  /// event to recover a previously returned connection. Retries cover temporary unavailability, connection
+  /// loss, operation timeouts, and service changes that invalidate setup.
+  /// @param device Device from this application service, including one resolved by RestoreDeviceAsync().
+  /// @param options Attempt limit, retry delays, and deadlines for connection and discovery.
+  /// @param restore_subscriptions Optional setup Task. The library retires a failed attempt before retrying.
+  /// @param on_event Optional events from the returned session, delivered on the application thread after handoff.
+  /// @return A session, services, and subscriptions on success, or the final operation error. An existing
+  /// recovery or GATT session for the device can return Busy.
+  /// @code{.cpp}
+  /// auto connected = co_await bluetooth->ConnectWithRetryAsync(device, {}, RestoreProfileSubscriptions, OnGattEvent);
+  /// if (connected.Succeeded()) {
+  ///   StoreConnection(std::move(connected).Value());
+  /// } else {
+  ///   ShowBluetoothError(connected.Error());
+  /// }
+  /// @endcode
+  Task<BluetoothResult<GattConnection>> ConnectWithRetryAsync(
+      Device device, ReconnectOptions options = {}, RestoreSubscriptions restore_subscriptions = {},
+      std::function<void(GattEvent)> on_event = {});
 
 private:
   explicit Bluetooth(std::shared_ptr<detail::Service> service);

@@ -13,7 +13,7 @@ The public contract describes operations and capabilities. Each backend reports 
 | Adapter and access | Adapter status when observable, permission checks, and user-initiated access flows | Adapter selection on hosts that expose multiple adapters |
 | Device discovery | Bounded foreground scanning on native platforms, browser device selection on Web, and device recovery where the host permits it | Additional scan filters and system accessory setup flows |
 | Pairing | System-managed authentication for protected GATT operations, plus explicit pairing and bond queries on supported backends | Unpairing and platform-specific association management |
-| BLE client | Connect, discover, read, write, subscribe, disconnect, and explicitly reconnect | Policy-driven reconnect, background communication, and state restoration |
+| BLE client | Connect, discover, read, write, subscribe, disconnect, and recover a foreground connection with its subscriptions | Background communication and process restoration |
 | BLE peripheral | Capability reporting for advertising and GATT server operations | Advertising, local GATT services, and server-side request handling |
 | Additional transports | The device model leaves room for transport-specific endpoints | Classic RFCOMM, applicable Apple accessory sessions, and LE L2CAP channels |
 
@@ -281,7 +281,7 @@ void Install(ApplicationContext& context);
 } // namespace huxerui::bluetooth
 ```
 
-Call service and session operations on the owning application thread. `WatchAdapterStatusAsync` emits the current status and then distinct changes until its HuxerUI task scope is canceled or the service closes. Start pairing from an explicit user action on backends that support it. `PairAsync` completes when the host confirms pairing or reports the device already paired. Check `GetBondStateAsync` when the UI needs the separately observable bond state. `RestoreDeviceAsync` re-resolves a saved identifier through the backend's known-device or grant API. It can recover a device that is currently out of range.
+Call service and session operations on the owning application thread. `WatchAdapterStatusAsync` emits the current status and then distinct changes until its HuxerUI task scope is canceled or the service closes. Start pairing from an explicit user action on backends that support it. `PairAsync` completes when the host confirms pairing or reports the device already paired. Check `GetBondStateAsync` when the UI needs the separately observable bond state. `RestoreDeviceAsync` re-resolves a saved identifier through the backend's known-device or grant API. It can recover a device that is currently out of range. See the connection helper for `ConnectWithRetryAsync()`. [Connection helper](#connection-helper)
 
 `SelectDevice` starts the chooser as part of the initiating call and returns a Task that waits for its outcome. Start it inside the actual user action and move the Task into the caller's task scope. If the caller cancels and the host cannot dismiss the chooser, the library drops delivery to that caller and releases the chooser slot when the host settles it. The other Task-returning operations start when awaited or launched. A canceled HuxerUI task scope detaches its continuation. A platform cancellation can still be returned as `Canceled` to a live caller.
 
@@ -418,6 +418,133 @@ Keep the existing `HuxerUI::Bluetooth` CMake target and the Preview's `huxerui_u
 
 iOS and macOS compile their own Core Bluetooth implementations. The shared C++ layer owns the application API and operation lifecycle across all platforms. The Windows GATT backend requires the asynchronous GATT APIs introduced with Windows 10 version 1703. [iOS backend](../platform/ios/src/bluetooth.mm) · [macOS backend](../platform/macos/src/bluetooth.mm) · [Windows BluetoothLEDevice API](https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.bluetoothledevice)
 
+## Device management and foreground reconnection
+
+An application can remember a selected device, recover it when it next opens, and resume the GATT subscriptions required by its device protocol after a connection loss. Use `RestoreDeviceAsync()` for device identity and `ConnectWithRetryAsync()` for the opt-in retry and setup sequence.
+
+### Saved devices
+
+Save a copy of `Device::Id()` when the user chooses a device from a scan or system chooser. The application owns the saved record and can also keep a display name and the association with its device profile. The identifier is scoped to its backend. On startup, load the saved identifier and call `RestoreDeviceAsync()` when `can_restore_device` is available.
+
+A successful recovery returns a `Device` that the backend currently recognizes. Bluetooth authorization, the system bond, and reachability are established by their respective operations. A device can be recognized while it is out of range. A failed recovery leaves the saved record available to the application. When recovery is unavailable or the backend no longer recognizes the identifier, the user can select the device again and update the saved record. Retry connection attempts against an already resolved `Device`.
+
+The saved device list represents the user's selections in this application. Removing a saved record removes the application's preference. Use `GetBondStateAsync()` where supported when the UI also needs the system bond. Platform-authorized device enumeration, unpairing, and access revocation remain independent operations with their own availability.
+
+On Web, the existing recovery path looks up the identifier among devices previously granted to the site when the browser exposes that API. Start a new chooser through `SelectDevice()` from a user gesture when a new grant is needed. On iOS and macOS, Core Bluetooth resolves identifiers against known peripherals. The application still uses its permission and connection results to determine current access. [Web Bluetooth device access](https://developer.chrome.com/docs/capabilities/bluetooth) · [Core Bluetooth known-device lookup](https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/retrieveperipherals(withidentifiers:))
+
+### Connection helper
+
+The operation is a lazy Task with a bounded number of attempts. It can open a connection to a recovered device at startup or rebuild a connection after an unexpected disconnect. The library admits one pending recovery per device. The result groups the existing move-only handles with the services discovered for that session.
+
+```cpp
+struct ReconnectOptions {
+  std::size_t max_attempts = 3;
+  std::chrono::milliseconds initial_retry_delay{250};
+  std::chrono::milliseconds max_retry_delay{2000};
+  OperationOptions operation;
+};
+
+struct GattConnection {
+  GattSession session;
+  std::vector<GattService> services;
+  std::vector<GattSubscription> subscriptions;
+};
+
+using RestoreSubscriptions = std::function<Task<BluetoothResult<std::vector<GattSubscription>>>(
+    GattSession&, std::span<const GattService>)>;
+
+// Member of Bluetooth.
+Task<BluetoothResult<GattConnection>> ConnectWithRetryAsync(
+    Device device, ReconnectOptions options = {}, RestoreSubscriptions restore_subscriptions = {},
+    std::function<void(GattEvent)> on_event = {});
+```
+
+Each attempt calls `ConnectAsync()`, then `DiscoverAsync()`, then the optional `restore_subscriptions` Task. An empty callback yields a connection and discovered services with an empty subscription list. `operation` supplies the existing per-operation deadline for connection and discovery. The application's subscription setup can pass `OperationOptions` to each `SubscribeAsync()` call.
+
+The first attempt starts immediately when the Task begins in the foreground. `max_attempts` counts the first attempt and must be positive. Before a retry, delay by `initial_retry_delay` and double the delay for each subsequent retry up to `max_retry_delay`. Both delays must be positive and the maximum must be at least the initial delay. Invalid options, including a nonpositive `operation.timeout`, return `InvalidArgument` before the first attempt. The attempt limit applies to the full connection and setup sequence.
+
+Retry `DeviceUnavailable`, `Disconnected`, and `TimedOut` during connection or setup. A snapshot invalidated during setup can use a retry when the current attempt observed a service database change. Report the last error when the retry budget is exhausted. Other errors end the batch. This includes `Busy`, which can mean that another operation already owns the device. The application can use existing permission and adapter APIs to decide when to start a new batch.
+
+### Subscription setup and ownership
+
+`RestoreSubscriptions` receives the candidate session and its GATT snapshot. The helper owns both throughout setup, and the callback borrows them until its returned Task completes. Subscription setup runs in the application task scope. The callback resolves its targets using the current snapshot, calls `SubscribeAsync()`, and returns the owners for the required subscriptions. An application can handle an optional subscription failure inside the callback and include its remaining subscriptions in the result.
+
+Resolve by service and characteristic UUID when that pair is unique. If the same UUID appears more than once, the device profile must identify the intended instance from the new snapshot or return an error. This keeps attribute selection tied to the application protocol. A missing required characteristic can return `UnsupportedProperty`, and an ambiguous selection can return `InvalidArgument`.
+
+An attempt publishes a successful result after connection, discovery, and required subscription setup succeed on the same snapshot. During setup, the helper observes disconnect and service-change events so it can reject a retired candidate. A failed or canceled attempt releases its subscriptions and closes its session before another attempt starts. After handoff, the application's `on_event` receives events from the returned session and the application owns its lifetime.
+
+Value callbacks follow the existing `SubscribeAsync()` delivery contract. A subscription can begin delivering after it is enabled while the application is still setting up another subscription. Applications that need to delay updates until their model is ready can gate their handlers on that model. Replaying a business command after recovery follows the device protocol's idempotency rules.
+
+### Foreground lifecycle
+
+Start the helper while the application is active. A temporary inactive transition lets an already admitted attempt finish. If the initial attempt or a retry reaches admission while the application is inactive, end the batch with `Canceled`. Entering the background retires any pending batch and drops late results. A new batch on return to the foreground is an application decision. Connections that have already been handed to the application retain the existing `GattSession` lifetime contract.
+
+Run the helper in the application's chosen `TaskScope`. Keep its `TaskHandle` while recovery is pending and cancel it when the user disconnects, changes devices, or closes the owning view. HuxerUI Task cancellation detaches the caller's continuation. A batch retired by the library's foreground rule returns `Canceled` to a live caller. The connection helper uses the existing operations without requesting a chooser or starting an explicit pairing flow. System access or authentication behavior during a platform operation still applies.
+
+After an intentional disconnect, leave recovery idle. After an unexpected disconnect eligible for retry, the application can schedule the helper from its existing `GattDisconnected` handler, using the retained `Device`. The event arrives after the library retires the old connection slot. Clear the retired session and subscription owners before starting the next batch. Track one recovery Task in the application model so a repeated event or user click cannot start another batch for the same device.
+
+### Application flow
+
+On startup the application resolves its saved device and passes it to the connection helper. The same subscription callback can be used on startup and after an unexpected disconnect.
+
+```cpp
+auto restored = co_await bluetooth->RestoreDeviceAsync(saved_device_id);
+if (!restored.Succeeded()) {
+  ShowDeviceRecoveryError(restored.Error());
+  co_return;
+}
+
+auto device = std::move(restored).Value();
+auto connection = co_await bluetooth->ConnectWithRetryAsync(
+    device, {}, RestoreDeviceProfileSubscriptions, OnGattEvent);
+if (connection.Succeeded()) {
+  StoreConnection(std::move(device), std::move(connection).Value());
+} else {
+  ShowConnectionError(connection.Error());
+}
+```
+
+```cpp
+Task<BluetoothResult<std::vector<GattSubscription>>> RestoreDeviceProfileSubscriptions(
+    GattSession& session, std::span<const GattService> services) {
+  auto characteristic = FindDeviceProfileCharacteristic(services);
+  if (!characteristic.Succeeded()) {
+    co_return BluetoothResult<std::vector<GattSubscription>>::Failure(
+        std::move(characteristic).Error());
+  }
+
+  auto subscribed = co_await session.SubscribeAsync(
+      std::move(characteristic).Value(), ConsumeDeviceUpdate);
+  if (!subscribed.Succeeded()) {
+    co_return BluetoothResult<std::vector<GattSubscription>>::Failure(
+        std::move(subscribed).Error());
+  }
+
+  std::vector<GattSubscription> subscriptions;
+  subscriptions.push_back(std::move(subscribed).Value());
+  co_return BluetoothResult<std::vector<GattSubscription>>::Success(std::move(subscriptions));
+}
+```
+
+The application event handler starts the same connection operation with the retained device. It checks its auto-reconnect setting, the error, and its current lifecycle before scheduling a Task. A service change on a live session uses the existing discovery and subscription setup directly.
+
+```cpp
+void OnGattEvent(GattEvent event) {
+  const auto* disconnected = std::get_if<GattDisconnected>(&event);
+  if (!disconnected) {
+    RefreshCurrentGattSubscriptions();
+    return;
+  }
+
+  ClearCurrentConnection();
+  if (disconnected->error && ShouldReconnect(*disconnected->error)) {
+    StartConnectionTaskForSelectedDevice();
+  }
+}
+```
+
+The Preview stores one selected device identifier in the application data directory. At startup it tries to restore the selection using existing access. The Restore saved device action lets the user retry and request permission where needed. Connect opens the selected device on demand. The Auto reconnect switch applies to the current application run. After an eligible unexpected disconnect while active, the Preview opens a fresh session and restores the previous subscription by its service and characteristic UUIDs. Cancel connection and turning off Auto reconnect both cancel pending recovery. Forget saved device clears the Preview's saved selection.
+
 ## Extension contracts
 
 ### Advertising and local GATT
@@ -430,9 +557,7 @@ A GATT server owns registered services, characteristic and descriptor definition
 
 RFCOMM exposes classic service discovery by UUID, an outbound byte stream, and explicit close. Listener and inbound connection support can be added where the host provides them. Classic serial printers, modules, and scanners are candidate clients. LE L2CAP uses a channel endpoint and separate capability. Apple External Accessory uses the accessory protocol declared by the application. Device profiles such as audio, keyboard input, and MIDI belong to the relevant OS services or application libraries. [Qt Bluetooth socket](https://doc.qt.io/qt-6/qbluetoothsocket.html) · [BlueZ profile API](https://bluez.readthedocs.io/en/latest/profile-api/) · [Core Bluetooth L2CAP](https://developer.apple.com/documentation/corebluetooth/cbperipheral/openl2capchannel(_:))
 
-### Reconnect and background operation
-
-Define foreground reconnect, background communication, and process restoration separately. An opt-in reconnect policy owns its retry budget, backoff, and cancellation. It reacquires the device, opens a fresh session, and allows the caller to reconcile its subscriptions and the device's state. Retrying commands requires the application protocol's rules for idempotency.
+### Background communication and process restoration
 
 Background capabilities depend on the host lifecycle and app configuration. Android provides mechanisms such as companion-device integration and foreground services for eligible workloads. iOS has Core Bluetooth background modes and state preservation and restoration for eligible workloads. Feature support describes the exact work and lifecycle the backend can sustain. [Android background BLE](https://developer.android.com/develop/connectivity/bluetooth/ble/background) · [Apple background processing and restoration](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/CoreBluetoothBackgroundProcessingForIOSApps/PerformingTasksWhileYourAppIsInTheBackground.html)
 

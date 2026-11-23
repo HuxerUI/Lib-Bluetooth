@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <exception>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -116,12 +117,17 @@ struct Subscription {
   bool ready = false;
 };
 
+struct ConnectionSetup {
+  std::optional<BluetoothError> interruption;
+};
+
 struct Session {
   std::weak_ptr<Service> service;
   Token id;
   std::string device;
   GattConnectionState status = GattConnectionState::Connected;
   EventHandler<GattEvent> handler;
+  std::shared_ptr<ConnectionSetup> setup;
   Token snapshot = 0;
   WriteLimits limits;
   Token active_request = 0;
@@ -151,6 +157,16 @@ struct Access {
 
   static GattSession MakeSession(std::shared_ptr<Session> session) {
     return GattSession(std::move(session));
+  }
+
+  static Token Snapshot(const GattSession& session) {
+    return session.session_ ? session.session_->snapshot : 0;
+  }
+
+  static void FinishSetup(GattSession& session, std::function<void(GattEvent)> observer) {
+    if (observer)
+      session.session_->handler = std::make_shared<decltype(observer)>(std::move(observer));
+    session.session_->setup.reset();
   }
 
   static GattSubscription MakeSubscription(std::shared_ptr<Subscription> subscription) {
@@ -209,10 +225,36 @@ struct Selection {
   }
 };
 
+struct PreparedConnection {
+  GattConnection connection;
+  Token snapshot;
+  std::shared_ptr<ConnectionSetup> setup;
+
+  std::optional<BluetoothError> Check() const {
+    if (setup->interruption)
+      return setup->interruption;
+    if (connection.session.State() != GattConnectionState::Connected)
+      return Error(Code::Disconnected, "The GATT session closed during setup");
+    if (Access::Snapshot(connection.session) != snapshot)
+      return Error(Code::StaleAttribute, "The GATT database changed during subscription setup");
+    return std::nullopt;
+  }
+};
+
+using PreparedResult = BluetoothResult<PreparedConnection>;
+
+struct PendingReconnect {
+  std::string device;
+  TaskHandle task;
+  CallbackCompletion<PreparedResult> completion;
+};
+
 struct Service : std::enable_shared_from_this<Service> {
   explicit Service(TaskScope scope) : tasks(std::move(scope)) {}
 
   ~Service() {
+    while (!reconnects.empty())
+      CancelReconnect(reconnects.begin()->first, Error(Code::Unavailable, "Bluetooth service closed"));
     if (scan)
       scan->deadline.Cancel();
     for (auto& [id, session] : links) {
@@ -230,6 +272,25 @@ struct Service : std::enable_shared_from_this<Service> {
       watch.end.Complete();
     if (selection)
       selection->Set(Fail(Code::Unavailable, "Bluetooth service closed"));
+  }
+
+  void CancelReconnect(Token id, std::optional<BluetoothError> error = {}) {
+    auto retired = reconnects.extract(id);
+    if (retired.empty())
+      return;
+    retired.mapped().task.Cancel();
+    if (error)
+      retired.mapped().completion.Complete(PreparedResult::Failure(std::move(*error)));
+  }
+
+  void EnterBackground() {
+    ++background_generation;
+    if (scan)
+      EndScan(scan->id, ScanEndReason::Stopped, true);
+    while (!reconnects.empty()) {
+      CancelReconnect(reconnects.begin()->first,
+                      Error(Code::Canceled, "Bluetooth recovery ended when the application entered the background"));
+    }
   }
 
   void EnsureBackend() {
@@ -343,6 +404,8 @@ struct Service : std::enable_shared_from_this<Service> {
       return;
     RetireSnapshot(*session);
     const auto error = Error(Code::StaleAttribute, "The remote GATT database changed");
+    if (session->setup)
+      session->setup->interruption = error;
     std::vector<Token> stale;
     for (const auto& [id, work] : requests) {
       if (work.request.link == event.link && work.request.snapshot != 0)
@@ -411,6 +474,9 @@ struct Service : std::enable_shared_from_this<Service> {
   void CloseLink(std::shared_ptr<Session> session, std::optional<BluetoothError> error, bool notify) {
     if (session->status == GattConnectionState::Disconnected)
       return;
+    if (session->setup && !session->setup->interruption) {
+      session->setup->interruption = error.value_or(Error(Code::Disconnected, "The GATT session closed during setup"));
+    }
     session->status = GattConnectionState::Disconnecting;
     links.erase(session->id);
     RetireSnapshot(*session);
@@ -575,10 +641,12 @@ struct Service : std::enable_shared_from_this<Service> {
   AdapterStatus status = AdapterStatus::Unknown;
   bool backend_failed = false;
   Token next = 1;
+  std::uint64_t background_generation = 0;
   std::map<Token, AdapterWatch> watches;
   std::shared_ptr<Scan> scan;
   std::map<Token, std::shared_ptr<Session>> links;
   std::map<Token, Work> requests;
+  std::map<Token, PendingReconnect> reconnects;
   std::shared_ptr<Selection> selection;
 };
 
@@ -649,7 +717,8 @@ template <class T> Task<BluetoothResult<T>> DeviceOperation(std::weak_ptr<Servic
 }
 
 Task<BluetoothResult<GattSession>> Connect(std::weak_ptr<Service> weak, Device device, OperationOptions options,
-                                           std::function<void(GattEvent)> on_event) {
+                                           std::function<void(GattEvent)> on_event,
+                                           std::shared_ptr<ConnectionSetup> setup = {}) {
   auto service = weak.lock();
   if (!service || !Access::From(device, service))
     co_return BluetoothResult<GattSession>::Failure(Error(Code::DeviceUnavailable, "The device is unavailable"));
@@ -659,6 +728,7 @@ Task<BluetoothResult<GattSession>> Connect(std::weak_ptr<Service> weak, Device d
   session->service = service;
   session->id = service->next++;
   session->device = device.Id();
+  session->setup = std::move(setup);
   if (on_event)
     session->handler = std::make_shared<decltype(on_event)>(std::move(on_event));
   service->links.emplace(session->id, session);
@@ -674,6 +744,123 @@ Task<BluetoothResult<GattSession>> Connect(std::weak_ptr<Service> weak, Device d
     session->limits = *limits;
   session->connect_complete = true;
   co_return BluetoothResult<GattSession>::Success(std::move(owner));
+}
+
+Task<PreparedResult> PrepareConnection(std::weak_ptr<Service> weak, Device device, OperationOptions options,
+                                       const RestoreSubscriptions& restore,
+                                       const std::shared_ptr<ConnectionSetup>& setup) {
+  auto connected = co_await Connect(weak, std::move(device), options, {}, setup);
+  if (!connected.Succeeded())
+    co_return PreparedResult::Failure(std::move(connected).Error());
+  auto session = std::move(connected).Value();
+  auto discovered = co_await session.DiscoverAsync(options);
+  if (!discovered.Succeeded())
+    co_return PreparedResult::Failure(std::move(discovered).Error());
+  const auto snapshot = Access::Snapshot(session);
+  PreparedConnection prepared{{std::move(session), std::move(discovered).Value(), {}}, snapshot, setup};
+  auto& connection = prepared.connection;
+  if (restore) {
+    auto subscriptions = co_await restore(connection.session, connection.services);
+    if (!subscriptions.Succeeded())
+      co_return PreparedResult::Failure(std::move(subscriptions).Error());
+    connection.subscriptions = std::move(subscriptions).Value();
+  }
+  if (auto error = prepared.Check())
+    co_return PreparedResult::Failure(std::move(*error));
+  co_return PreparedResult::Success(std::move(prepared));
+}
+
+bool Retryable(Code code, const ConnectionSetup& setup) {
+  return code == Code::DeviceUnavailable || code == Code::Disconnected || code == Code::TimedOut ||
+         (code == Code::StaleAttribute && setup.interruption && setup.interruption->code == Code::StaleAttribute);
+}
+
+Task<PreparedResult> PrepareWithRetry(std::weak_ptr<Service> weak, Device device, ReconnectOptions options,
+                                      RestoreSubscriptions restore) {
+  auto delay = options.initial_retry_delay;
+  for (std::size_t attempt = 0;; ++attempt) {
+    if (UseApplication().LifecycleState() != ApplicationLifecycleState::Active)
+      co_return PreparedResult::Failure(Error(Code::Canceled, "Bluetooth recovery requires an active application"));
+    auto setup = std::make_shared<ConnectionSetup>();
+    auto result = co_await PrepareConnection(weak, device, options.operation, restore, setup);
+    if (result.Succeeded() || attempt + 1 >= options.max_attempts || !Retryable(result.Error().code, *setup))
+      co_return result;
+    co_await Delay(delay);
+    delay = delay > options.max_retry_delay / 2 ? options.max_retry_delay : delay * 2;
+  }
+}
+
+auto AwaitReconnect(std::weak_ptr<Service> weak, Device device, ReconnectOptions options, RestoreSubscriptions restore) {
+  return AwaitCallback<PreparedResult>(
+      [weak, device = std::move(device), options, restore = std::move(restore)]
+      (CallbackCompletion<PreparedResult> completion) mutable -> Cancellation {
+        auto owner = weak.lock();
+        if (!owner) {
+          completion.Complete(PreparedResult::Failure(Error(Code::Unavailable, "Bluetooth service closed")));
+          return {};
+        }
+        const auto device_id = device.Id();
+        if (std::ranges::any_of(owner->reconnects, [&](const auto& entry) { return entry.second.device == device_id; })) {
+          completion.Complete(PreparedResult::Failure(Error(Code::Busy, "Bluetooth recovery is already active")));
+          return {};
+        }
+        const auto id = owner->next++;
+        auto task = owner->tasks.Launch(
+            [weak, id, device = std::move(device), options, restore = std::move(restore)]() mutable -> Task<void> {
+              try {
+                auto result = co_await PrepareWithRetry(weak, std::move(device), options, std::move(restore));
+                if (auto service = weak.lock()) {
+                  auto finished = service->reconnects.extract(id);
+                  if (!finished.empty())
+                    finished.mapped().completion.Complete(std::move(result));
+                }
+              } catch (...) {
+                if (auto service = weak.lock()) {
+                  auto finished = service->reconnects.extract(id);
+                  if (!finished.empty())
+                    finished.mapped().completion.Fail(std::current_exception());
+                }
+              }
+            });
+        owner->reconnects.emplace(id, PendingReconnect{device_id, std::move(task), completion});
+        return [weak, id] {
+          if (auto service = weak.lock())
+            service->CancelReconnect(id);
+        };
+      });
+}
+
+Task<BluetoothResult<GattConnection>> ConnectWithRetry(std::weak_ptr<Service> weak, Device device,
+                                                      ReconnectOptions options, RestoreSubscriptions restore,
+                                                      std::function<void(GattEvent)> on_event) {
+  using Result = BluetoothResult<GattConnection>;
+  if (!options.max_attempts || options.initial_retry_delay <= std::chrono::milliseconds::zero() ||
+      options.max_retry_delay < options.initial_retry_delay ||
+      options.operation.timeout <= std::chrono::milliseconds::zero()) {
+    co_return Result::Failure(Error(Code::InvalidArgument, "Invalid Bluetooth recovery options"));
+  }
+  auto service = weak.lock();
+  if (!service || !Access::From(device, service))
+    co_return Result::Failure(Error(Code::DeviceUnavailable, "The device is unavailable"));
+  if (UseApplication().LifecycleState() != ApplicationLifecycleState::Active)
+    co_return Result::Failure(Error(Code::Canceled, "Bluetooth recovery requires an active application"));
+  const auto generation = service->background_generation;
+  service.reset();
+  auto result = co_await AwaitReconnect(weak, std::move(device), options, std::move(restore));
+  if (!result.Succeeded())
+    co_return Result::Failure(std::move(result).Error());
+  service = weak.lock();
+  if (!service)
+    co_return Result::Failure(Error(Code::Unavailable, "Bluetooth service closed"));
+  if (service->background_generation != generation ||
+      UseApplication().LifecycleState() == ApplicationLifecycleState::Background) {
+    co_return Result::Failure(Error(Code::Canceled, "Bluetooth recovery ended when the application entered the background"));
+  }
+  auto prepared = std::move(result).Value();
+  if (auto error = prepared.Check())
+    co_return Result::Failure(std::move(*error));
+  Access::FinishSetup(prepared.connection.session, std::move(on_event));
+  co_return Result::Success(std::move(prepared.connection));
 }
 
 Task<BluetoothResult<std::vector<GattService>>> Discover(std::shared_ptr<Session> session, OperationOptions options) {
@@ -1066,6 +1253,13 @@ Task<BluetoothResult<GattSession>> Bluetooth::ConnectAsync(Device device, Operat
   return detail::Connect(service_, std::move(device), options, std::move(on_event));
 }
 
+Task<BluetoothResult<GattConnection>> Bluetooth::ConnectWithRetryAsync(
+    Device device, ReconnectOptions options, RestoreSubscriptions restore_subscriptions,
+    std::function<void(GattEvent)> on_event) {
+  return detail::ConnectWithRetry(service_, std::move(device), options, std::move(restore_subscriptions),
+                                  std::move(on_event));
+}
+
 void Install(ApplicationContext& context) {
   detail::RegisterPlatform(context);
   auto service = std::make_shared<detail::Service>(UseApplicationTaskScope());
@@ -1076,8 +1270,8 @@ void Install(ApplicationContext& context) {
       current->EnsureBackend();
   });
   context.OnLifecycleChanged([weak](ApplicationLifecycleState state) {
-    if (auto current = weak.lock(); state == ApplicationLifecycleState::Background && current && current->scan)
-      current->EndScan(current->scan->id, ScanEndReason::Stopped, true);
+    if (auto current = weak.lock(); state == ApplicationLifecycleState::Background && current)
+      current->EnterBackground();
   });
 }
 

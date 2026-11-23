@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 using namespace huxerui;
@@ -18,10 +19,16 @@ struct DeviceRow {
   bool operator==(const DeviceRow&) const = default;
 };
 
+struct CharacteristicPath {
+  std::string service;
+  std::string characteristic;
+};
+
 struct Preview {
   State<AdapterStatus> adapter{AdapterStatus::Unknown};
   State<std::vector<DeviceRow>> devices{std::vector<DeviceRow>{}};
   State<std::optional<Device>> selected{std::optional<Device>{}};
+  State<std::string> saved_id{""};
   State<std::shared_ptr<const std::vector<GattService>>> services{std::make_shared<const std::vector<GattService>>()};
   State<std::optional<GattCharacteristic>> characteristic{std::optional<GattCharacteristic>{}};
   State<TextEditingValue> filter{TextEditingValue{}};
@@ -32,10 +39,18 @@ struct Preview {
   State<bool> connecting{false};
   State<bool> connected{false};
   State<bool> subscribed{false};
+  State<bool> auto_reconnect{false};
 
   std::optional<ScanSession> scan;
   std::optional<GattSession> session;
   std::optional<GattSubscription> subscription;
+  std::optional<CharacteristicPath> characteristic_path;
+  std::optional<File> selection_file;
+  std::optional<std::string> pending_selection;
+  std::uint64_t selection_revision = 0;
+  std::uint64_t connection_generation = 0;
+  bool saving_selection = false;
+  bool recovering = false;
   TaskHandle operation;
 
   void StopScan() {
@@ -46,11 +61,14 @@ struct Preview {
   void ClearAttributes() {
     subscription.reset();
     subscribed = false;
+    characteristic_path.reset();
     characteristic = std::optional<GattCharacteristic>{};
     services = std::make_shared<const std::vector<GattService>>();
+    value = std::string{};
   }
 
   void Disconnect() {
+    ++connection_generation;
     operation.Cancel();
     ClearAttributes();
     if (session)
@@ -58,6 +76,7 @@ struct Preview {
     session.reset();
     connecting = false;
     connected = false;
+    recovering = false;
   }
 
   void Report(const BluetoothError& error) {
@@ -130,18 +149,217 @@ std::string FormatHex(const Bytes& bytes) {
   return result.empty() ? "Empty value" : result;
 }
 
-Task<bool> Authorize(ApplicationHandle app, Permission permission) {
+Task<bool> Authorize(ApplicationHandle app, Permission permission, bool allow_prompt = true) {
 #if defined(__ANDROID__) || defined(__APPLE__)
   auto status = co_await app.CheckPermissionAsync(permission);
-  if (status == PermissionStatus::NotDetermined || status == PermissionStatus::Denied)
+  if (allow_prompt && (status == PermissionStatus::NotDetermined || status == PermissionStatus::Denied))
     status = co_await app.RequestPermissionAsync(permission);
   co_return status == PermissionStatus::Granted || status == PermissionStatus::Limited ||
             status == PermissionStatus::SystemDisabled;
 #else
   (void)app;
   (void)permission;
+  (void)allow_prompt;
   co_return true;
 #endif
+}
+
+void SaveSelection(const std::shared_ptr<Preview>& model, TaskScope tasks, std::optional<Device> device) {
+  ++model->selection_revision;
+  auto id = device ? device->Id() : std::string{};
+  model->selected = std::move(device);
+  model->saved_id = id;
+  if (!model->selection_file)
+    return;
+  model->pending_selection = std::move(id);
+  if (model->saving_selection)
+    return;
+  model->saving_selection = true;
+  tasks.Launch([model, file = *model->selection_file]() -> Task<void> {
+    const File staged(file.Path() + ".pending");
+    while (model->pending_selection) {
+      auto pending = std::exchange(model->pending_selection, std::nullopt);
+      const bool written = co_await staged.WriteStringAsync(std::move(*pending));
+      const bool saved = written && (co_await staged.MoveToAsync(file, true));
+      if (!saved && !model->pending_selection)
+        model->status = "Could not save device selection";
+    }
+    model->saving_selection = false;
+  });
+}
+
+Task<void> RestoreSelection(std::shared_ptr<Preview> model, std::shared_ptr<Bluetooth> bluetooth,
+                            ApplicationHandle app, bool load_from_storage) {
+  const auto revision = model->selection_revision;
+  if (load_from_storage) {
+    if (!model->selection_file || revision != 0)
+      co_return;
+    auto stored = co_await model->selection_file->ReadStringAsync();
+    if (model->selection_revision != revision || !stored.Succeeded())
+      co_return;
+    model->saved_id = std::move(stored).Value();
+  }
+  const std::string id = model->saved_id;
+  if (id.empty() || !bluetooth->Capabilities().can_restore_device)
+    co_return;
+  if (!co_await Authorize(app, Permission::BluetoothConnect, !load_from_storage)) {
+    if (!load_from_storage && model->selection_revision == revision)
+      model->status = "Bluetooth connect permission was denied";
+    co_return;
+  }
+  if (model->selection_revision != revision)
+    co_return;
+  auto restored = co_await bluetooth->RestoreDeviceAsync(id);
+  if (model->selection_revision != revision)
+    co_return;
+  if (restored.Succeeded()) {
+    model->selected = std::move(restored).Value();
+    model->status = "Saved device restored";
+  } else {
+    model->Report(restored.Error());
+  }
+}
+
+BluetoothResult<GattCharacteristic> FindCharacteristic(std::span<const GattService> services,
+                                                       const CharacteristicPath& path) {
+  using Result = BluetoothResult<GattCharacteristic>;
+  const GattCharacteristic* match = nullptr;
+  for (const auto& service : services) {
+    if (service.uuid != path.service)
+      continue;
+    for (const auto& characteristic : service.characteristics) {
+      if (characteristic.Uuid() != path.characteristic)
+        continue;
+      if (match)
+        return Result::Failure({.code = BluetoothErrorCode::InvalidArgument,
+                                .message = "The previous subscription matches more than one characteristic"});
+      match = &characteristic;
+    }
+  }
+  if (!match)
+    return Result::Failure({.code = BluetoothErrorCode::UnsupportedProperty,
+                            .message = "The previous subscription characteristic is unavailable"});
+  return Result::Success(*match);
+}
+
+bool CanReconnect(BluetoothErrorCode code) {
+  return code == BluetoothErrorCode::Disconnected || code == BluetoothErrorCode::DeviceUnavailable ||
+         code == BluetoothErrorCode::TimedOut || code == BluetoothErrorCode::StaleAttribute;
+}
+
+void StartConnection(const std::shared_ptr<Preview>& model, const std::shared_ptr<Bluetooth>& bluetooth,
+                     ApplicationHandle app, TaskScope tasks, Device device, bool automatic = false,
+                     std::optional<CharacteristicPath> restore_path = {}) {
+  if (model->connecting || model->connected)
+    return;
+  model->StopScan();
+  const auto generation = ++model->connection_generation;
+  model->connecting = true;
+  model->recovering = automatic;
+  model->status = automatic ? "Reconnecting" : "Connecting";
+  auto on_event = [weak = std::weak_ptr<Preview>(model), service = std::weak_ptr<Bluetooth>(bluetooth),
+                   app, tasks, device, generation](GattEvent event) {
+    auto current = weak.lock();
+    if (!current || current->connection_generation != generation)
+      return;
+    const auto* closed = std::get_if<GattDisconnected>(&event);
+    if (!closed) {
+      current->ClearAttributes();
+      current->status = "Services changed. Discover again.";
+      return;
+    }
+    const auto path = current->subscribed ? current->characteristic_path : std::nullopt;
+    ++current->connection_generation;
+    current->ClearAttributes();
+    current->session.reset();
+    current->connected = false;
+    if (closed->error) {
+      current->Report(*closed->error);
+      if (auto bluetooth = service.lock(); bluetooth && current->auto_reconnect &&
+          app.LifecycleState() == ApplicationLifecycleState::Active && CanReconnect(closed->error->code)) {
+        StartConnection(current, bluetooth, app, tasks, device, true, path);
+      }
+    } else {
+      current->status = "Disconnected";
+    }
+  };
+
+  model->operation = tasks.Launch(
+      [model, bluetooth, app, device = std::move(device), automatic, generation, restore_path = std::move(restore_path),
+       on_event = std::move(on_event)]() mutable -> Task<void> {
+        if (!co_await Authorize(app, Permission::BluetoothConnect, !automatic)) {
+          if (model->connection_generation == generation) {
+            model->connecting = false;
+            model->recovering = false;
+            model->status = "Bluetooth connect permission was denied";
+          }
+          co_return;
+        }
+        if (model->connection_generation != generation)
+          co_return;
+        if (!automatic) {
+          auto connected = co_await bluetooth->ConnectAsync(std::move(device), {}, std::move(on_event));
+          if (model->connection_generation != generation)
+            co_return;
+          model->connecting = false;
+          if (connected.Succeeded()) {
+            model->session.emplace(std::move(connected).Value());
+            model->connected = true;
+            model->status = "Connected";
+          } else {
+            model->Report(connected.Error());
+          }
+          co_return;
+        }
+
+        RestoreSubscriptions restore;
+        if (restore_path) {
+          restore = [path = *restore_path, weak = std::weak_ptr<Preview>(model), generation]
+                    (GattSession& session, std::span<const GattService> services)
+                    -> Task<BluetoothResult<std::vector<GattSubscription>>> {
+            using Result = BluetoothResult<std::vector<GattSubscription>>;
+            auto characteristic = FindCharacteristic(services, path);
+            if (!characteristic.Succeeded())
+              co_return Result::Failure(std::move(characteristic).Error());
+            auto subscribed = co_await session.SubscribeAsync(std::move(characteristic).Value(),
+                [weak, generation](Bytes value) {
+                  if (auto current = weak.lock(); current && current->connection_generation == generation &&
+                      current->connected && current->subscribed) {
+                    current->value = FormatHex(value);
+                  }
+                });
+            if (!subscribed.Succeeded())
+              co_return Result::Failure(std::move(subscribed).Error());
+            std::vector<GattSubscription> subscriptions;
+            subscriptions.push_back(std::move(subscribed).Value());
+            co_return Result::Success(std::move(subscriptions));
+          };
+        }
+        auto recovered = co_await bluetooth->ConnectWithRetryAsync(
+            std::move(device), {}, std::move(restore), std::move(on_event));
+        if (model->connection_generation != generation)
+          co_return;
+        model->connecting = false;
+        model->recovering = false;
+        if (!recovered.Succeeded()) {
+          model->Report(recovered.Error());
+          co_return;
+        }
+        auto connection = std::move(recovered).Value();
+        if (restore_path && !connection.subscriptions.empty()) {
+          auto characteristic = FindCharacteristic(connection.services, *restore_path);
+          if (characteristic.Succeeded()) {
+            model->characteristic = std::move(characteristic).Value();
+            model->characteristic_path = *restore_path;
+            model->subscription.emplace(std::move(connection.subscriptions.front()));
+            model->subscribed = true;
+          }
+        }
+        model->session.emplace(std::move(connection.session));
+        model->services = std::make_shared<const std::vector<GattService>>(std::move(connection.services));
+        model->connected = true;
+        model->status = "Connection restored";
+      });
 }
 
 View AttributeControls(const std::shared_ptr<Preview>& model, TaskScope tasks) {
@@ -149,17 +367,20 @@ View AttributeControls(const std::shared_ptr<Preview>& model, TaskScope tasks) {
   if (!characteristic || !model->session)
     return {};
   const auto properties = characteristic->Properties();
+  const auto generation = model->connection_generation;
   const bool subscribed = model->subscribed;
-  const auto write = [model, tasks, characteristic](GattWriteMode mode) {
+  const auto write = [model, tasks, characteristic, generation](GattWriteMode mode) {
     auto bytes = ParseHex(model->payload->text);
     if (!bytes) {
       model->status = "Enter hexadecimal byte pairs";
       return;
     }
-    tasks.Launch([model, characteristic, mode, bytes = std::move(*bytes)]() mutable -> Task<void> {
-      if (!model->session)
+    tasks.Launch([model, characteristic, generation, mode, bytes = std::move(*bytes)]() mutable -> Task<void> {
+      if (!model->session || model->connection_generation != generation)
         co_return;
       auto result = co_await model->session->WriteAsync(*characteristic, std::move(bytes), mode);
+      if (model->connection_generation != generation)
+        co_return;
       if (result.Succeeded())
         model->status = mode == GattWriteMode::WithResponse ? "Write acknowledged" : "Write accepted";
       else
@@ -173,11 +394,14 @@ View AttributeControls(const std::shared_ptr<Preview>& model, TaskScope tasks) {
         .Placeholder("00 ff 2a")
         .OnChanged([model](const TextEditingValue& value) { model->payload = value; }),
     Flow {
-      Button("Read").With(Enabled(properties.can_read)).OnClick([model, tasks, characteristic] {
-        tasks.Launch([model, characteristic]() -> Task<void> {
-          if (!model->session)
+      Button("Read").With(Enabled(properties.can_read)).OnClick([model, tasks, characteristic, generation] {
+        tasks.Launch([model, characteristic, generation]() -> Task<void> {
+          if (!model->session || model->connection_generation != generation)
             co_return;
           auto result = co_await model->session->ReadAsync(*characteristic);
+          const std::optional<GattCharacteristic> selected = model->characteristic;
+          if (model->connection_generation != generation || selected != characteristic)
+            co_return;
           if (result.Succeeded())
             model->value = FormatHex(result.Value());
           else
@@ -190,24 +414,31 @@ View AttributeControls(const std::shared_ptr<Preview>& model, TaskScope tasks) {
           .OnClick([write] { write(GattWriteMode::WithoutResponse); }),
       Button(subscribed ? "Unsubscribe" : "Subscribe")
           .With(Enabled(properties.can_notify || properties.can_indicate))
-          .OnClick([model, tasks, characteristic, subscribed] {
+          .OnClick([model, tasks, characteristic, subscribed, generation] {
+            if (model->connection_generation != generation)
+              return;
             if (subscribed) {
               model->subscription.reset();
               model->subscribed = false;
               return;
             }
-            tasks.Launch([model, characteristic]() -> Task<void> {
-              if (!model->session)
+            tasks.Launch([model, characteristic, generation]() -> Task<void> {
+              if (!model->session || model->connection_generation != generation)
                 co_return;
               auto result = co_await model->session->SubscribeAsync(*characteristic,
-                  [weak = std::weak_ptr<Preview>(model)](Bytes value) {
-                    if (auto current = weak.lock())
-                      current->value = FormatHex(value);
+                  [weak = std::weak_ptr<Preview>(model), characteristic, generation](Bytes value) {
+                    if (auto current = weak.lock(); current && current->connection_generation == generation) {
+                      const std::optional<GattCharacteristic> selected = current->characteristic;
+                      if (selected == characteristic)
+                        current->value = FormatHex(value);
+                    }
                   });
               const std::optional<GattCharacteristic> selected = model->characteristic;
+              if (model->connection_generation != generation || selected != characteristic)
+                co_return;
               if (!result.Succeeded()) {
                 model->Report(result.Error());
-              } else if (selected == characteristic) {
+              } else {
                 model->subscription.emplace(std::move(result).Value());
                 model->subscribed = true;
               }
@@ -219,7 +450,13 @@ View AttributeControls(const std::shared_ptr<Preview>& model, TaskScope tasks) {
 }
 
 void InstallPreview(ApplicationContext& context) {
-  context.Provide(std::make_shared<Preview>());
+  auto model = std::make_shared<Preview>();
+  try {
+    model->selection_file = UseApplication().Directories().data_directory.Child("bluetooth-device.txt");
+  } catch (const std::logic_error&) {
+    // Some hosts do not provide application storage.
+  }
+  context.Provide(std::move(model));
 }
 
 } // namespace
@@ -227,6 +464,7 @@ void InstallPreview(ApplicationContext& context) {
 View App() {
   const auto app = UseApplication();
   const auto tasks = UseTaskScope();
+  const auto app_tasks = UseApplicationTaskScope();
   const auto bluetooth = UseService<Bluetooth>();
   const auto model = UseService<Preview>();
   const auto capabilities = bluetooth->Capabilities();
@@ -235,32 +473,41 @@ View App() {
   const bool connecting = model->connecting;
   const bool connected = model->connected;
   const std::optional<Device> selected = model->selected;
+  const std::string saved_id = model->saved_id;
+  const bool auto_reconnect = model->auto_reconnect;
   const std::vector<DeviceRow>& devices = model->devices;
   const std::shared_ptr<const std::vector<GattService>> services = model->services;
   const AdapterStatus adapter = model->adapter;
 
-  Lifecycle([model, bluetooth, tasks, weak] {
+  Lifecycle([model, bluetooth, app, tasks, weak] {
     auto watcher = tasks.Launch(bluetooth->WatchAdapterStatusAsync([weak](AdapterStatus value) {
       if (auto current = weak.lock())
         current->adapter = value;
     }));
-    return [model, watcher] {
+    auto restore = tasks.Launch(RestoreSelection(model, bluetooth, app, true));
+    return [model, watcher, restore] {
       watcher.Cancel();
+      restore.Cancel();
       model->StopScan();
       model->Disconnect();
     };
   });
 
   std::vector<View> attributes;
+  const auto generation = model->connection_generation;
   for (const auto& service : *services) {
     attributes.push_back(Text(service.uuid, TextRole::Title));
     for (const auto& characteristic : service.characteristics) {
-      attributes.push_back(Button(characteristic.Uuid()).OnClick([model, characteristic] {
-        model->subscription.reset();
-        model->subscribed = false;
-        model->value = std::string{};
-        model->characteristic = characteristic;
-      }));
+      attributes.push_back(Button(characteristic.Uuid()).OnClick(
+          [model, generation, characteristic, service_uuid = service.uuid] {
+            if (model->connection_generation != generation)
+              return;
+            model->subscription.reset();
+            model->subscribed = false;
+            model->value = std::string{};
+            model->characteristic = characteristic;
+            model->characteristic_path = CharacteristicPath{service_uuid, characteristic.Uuid()};
+          }));
     }
   }
 
@@ -295,7 +542,7 @@ View App() {
     });
 
   const auto chooser_button = Button("Select device").With(Enabled(!connecting && !connected))
-    .OnClick([model, bluetooth, tasks] {
+    .OnClick([model, bluetooth, tasks, app_tasks] {
       SelectDeviceOptions options;
       const auto& filter = model->filter->text;
       if (filter.empty()) {
@@ -303,11 +550,14 @@ View App() {
         return;
       }
       options.advertised_services.push_back(filter);
+      const auto revision = model->selection_revision;
       auto selection = bluetooth->SelectDevice(std::move(options));
-      tasks.Launch([model, selection = std::move(selection)]() mutable -> Task<void> {
+      tasks.Launch([model, app_tasks, revision, selection = std::move(selection)]() mutable -> Task<void> {
         auto result = co_await std::move(selection);
+        if (model->selection_revision != revision || model->connecting || model->connected)
+          co_return;
         if (result.Succeeded()) {
-          model->selected = std::move(result).Value();
+          SaveSelection(model, app_tasks, std::move(result).Value());
           model->status = "Device selected";
         } else {
           model->Report(result.Error());
@@ -331,10 +581,13 @@ View App() {
       });
 
   const auto discover_button = Button("Discover services").OnClick([model, tasks] {
-    tasks.Launch([model]() -> Task<void> {
-      if (!model->session)
+    const auto generation = model->connection_generation;
+    tasks.Launch([model, generation]() -> Task<void> {
+      if (!model->session || model->connection_generation != generation)
         co_return;
       auto result = co_await model->session->DiscoverAsync();
+      if (model->connection_generation != generation)
+        co_return;
       if (result.Succeeded() && model->session) {
         model->ClearAttributes();
         model->services = std::make_shared<const std::vector<GattService>>(std::move(result).Value());
@@ -349,6 +602,13 @@ View App() {
     Text("Bluetooth", TextRole::Title),
     Text(StatusText(adapter)),
     Text(model->status),
+    Switch("Auto reconnect", auto_reconnect).OnChanged([model](bool enabled) {
+      model->auto_reconnect = enabled;
+      if (!enabled && model->recovering) {
+        model->Disconnect();
+        model->status = "Reconnect canceled";
+      }
+    }),
     TextField(model->filter)
         .Label("Advertised service UUID")
         .Placeholder("Any service")
@@ -357,56 +617,36 @@ View App() {
       capabilities.can_scan ? View(scan_button) : View{},
       capabilities.can_select_device ? View(chooser_button) : View{},
       capabilities.can_pair && selected.has_value() ? View(pair_button) : View{},
+      capabilities.can_restore_device && !saved_id.empty() && !selected
+          ? View(Button("Restore saved device").OnClick([model, bluetooth, app, tasks] {
+              tasks.Launch(RestoreSelection(model, bluetooth, app, false));
+            }))
+          : View{},
+      !saved_id.empty() && !connecting && !connected
+          ? View(Button("Forget saved device").OnClick([model, app_tasks] {
+              SaveSelection(model, app_tasks, std::nullopt);
+              model->status = "Saved device removed";
+            }))
+          : View{},
       Button(connecting ? "Cancel connection" : connected ? "Disconnect" : "Connect")
           .With(Enabled(selected.has_value() || connecting || connected))
-          .OnClick([model, bluetooth, app, tasks, weak, selected, connecting, connected] {
-            if (connected || connecting) {
+          .OnClick([model, bluetooth, app, tasks] {
+            if (model->connected || model->connecting) {
               model->Disconnect();
               model->status = "Disconnected";
               return;
             }
-            if (!selected)
-              return;
-            model->StopScan();
-            model->connecting = true;
-            model->status = "Connecting";
-            model->operation = tasks.Launch([model, bluetooth, app, weak, selected]() -> Task<void> {
-              if (!co_await Authorize(app, Permission::BluetoothConnect)) {
-                model->connecting = false;
-                model->status = "Bluetooth connect permission was denied";
-                co_return;
-              }
-              auto result = co_await bluetooth->ConnectAsync(*selected, {}, [weak](GattEvent event) {
-                if (auto current = weak.lock()) {
-                  current->ClearAttributes();
-                  if (const auto* closed = std::get_if<GattDisconnected>(&event)) {
-                    current->session.reset();
-                    current->connected = false;
-                    if (closed->error)
-                      current->Report(*closed->error);
-                    else
-                      current->status = "Disconnected";
-                  } else {
-                    current->status = "Services changed. Discover again.";
-                  }
-                }
-              });
-              model->connecting = false;
-              if (result.Succeeded()) {
-                model->session.emplace(std::move(result).Value());
-                model->connected = true;
-                model->status = "Connected";
-              } else {
-                model->Report(result.Error());
-              }
-            });
+            const std::optional<Device> device = model->selected;
+            if (device)
+              StartConnection(model, bluetooth, app, tasks, *device);
           }),
       connected ? View(discover_button) : View{},
     }.With(Spacing(8.0F)),
     selected ? View(Text("Selected: " + selected->Name().value_or(selected->Id()))) : View{},
-    ForEach(devices, [model, connecting, connected](const DeviceRow& row) {
+    ForEach(devices, [model, app_tasks, connecting, connected](const DeviceRow& row) {
       return Button(row.label).With(Enabled(!connecting && !connected))
-          .OnClick([model, device = row.device] { model->selected = device; }).Key(row.device.Id());
+          .OnClick([model, app_tasks, device = row.device] { SaveSelection(model, app_tasks, device); })
+          .Key(row.device.Id());
     }),
     Column(std::move(attributes)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     AttributeControls(model, tasks),
