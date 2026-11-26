@@ -1,0 +1,35 @@
+import std;
+import mcpp;
+import huxerui.rules;
+
+namespace {
+
+void ConfigureLinuxGlib() {
+    if (std::string_view(mcpp::target_os()) != "linux") {
+        return;
+    }
+    const std::string glib = mcpp::xpkg_dir("xim", "glib");
+    if (glib.empty()) {
+        return;
+    }
+    const auto root = std::filesystem::path(glib);
+    mcpp::include_dir((root / "include" / "glib-2.0").string().c_str());
+    mcpp::include_dir((root / "include" / "gio-unix-2.0").string().c_str());
+    mcpp::include_dir((root / "lib" / "glib-2.0" / "include").string().c_str());
+    mcpp::link_search((root / "lib").string().c_str());
+    mcpp::link_lib("gio-2.0");
+    mcpp::link_lib("gobject-2.0");
+    mcpp::link_lib("glib-2.0");
+}
+
+} // namespace
+
+int main() {
+    const auto src = std::filesystem::path(mcpp::manifest_dir()) / "src";
+    mcpp::include_dir(src.string().c_str());
+    ConfigureLinuxGlib();
+    return huxerui::rules::configure({
+        .resources = "resources",
+        .resource_namespace = "huxerui_bluetooth",
+    }) ? 0 : 1;
+}

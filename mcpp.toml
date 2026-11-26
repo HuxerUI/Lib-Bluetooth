@@ -1,0 +1,60 @@
+[package]
+namespace   = "huxerui"
+name        = "bluetooth"
+version     = "0.1.0"
+standard    = "c++23"
+license     = "MIT"
+repo        = "https://github.com/HuxerUI/Lib-Bluetooth"
+description = "Cross-platform Bluetooth LE discovery, pairing, advertising, GATT, and RFCOMM/L2CAP channels for HuxerUI"
+
+[package.metadata.huxerui]
+library   = "HuxerUI::Bluetooth"
+namespace = "huxerui::bluetooth"
+id        = "org.huxerui.lib.bluetooth"
+resources = "resources"
+
+[dependencies]
+huxerui.huxerui = "0.5.5"
+
+[target.'cfg(all(os = "linux", not(env = "android")))'.dependencies]
+compat.bluez = "5.88"
+
+[target.'cfg(all(os = "linux", not(env = "android")))'.xlings.workspace]
+"xim:glib" = "2.88.3"
+
+[targets.bluetooth]
+kind = "lib"
+
+[lib]
+path = "modules/bluetooth.cppm"
+
+[build]
+sources      = []
+include_dirs = ["include"]
+
+[target.'cfg(all(os = "linux", not(env = "android")))'.build]
+sources = ["platform/linux/src/*.cpp"]
+
+[target.'cfg(env = "android")'.build]
+sources = ["platform/android/src/main/cpp/*.cpp"]
+
+[target.windows.build]
+sources = ["platform/windows/src/*.cpp"]
+defines = ["NOMINMAX", "WIN32_LEAN_AND_MEAN"]
+
+[target.windows.runtime]
+libraries = ["runtimeobject"]
+
+[target.macos.build]
+sources  = ["platform/macos/src/*.mm"]
+cxxflags = ["-fobjc-arc"]
+
+[target.macos.runtime]
+frameworks = ["CoreBluetooth", "IOBluetooth", "Foundation"]
+
+[target.'cfg(os = "ios")'.build]
+sources  = ["platform/ios/src/*.mm"]
+cxxflags = ["-fobjc-arc"]
+
+[target.'cfg(os = "ios")'.runtime]
+frameworks = ["CoreBluetooth", "Foundation"]
